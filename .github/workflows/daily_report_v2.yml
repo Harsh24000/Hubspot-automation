@@ -2,6 +2,8 @@ name: NirogGyan Daily Pulse V2
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '30 3 * * 1-6'
 
 jobs:
   send-daily-report:
@@ -20,12 +22,11 @@ jobs:
 
       - name: Run daily report v2
         env:
-          HUBSPOT_TOKEN:              ${{ secrets.HUBSPOT_TOKEN }}
-          GMAIL_ADDRESS:              ${{ secrets.GMAIL_ADDRESS }}
-          GMAIL_APP_PASSWORD:         ${{ secrets.GMAIL_APP_PASSWORD }}
-          RECIPIENT_EMAIL:            ${{ secrets.RECIPIENT_EMAIL }}
-          APOLLO_API_KEY:             ${{ secrets.APOLLO_API_KEY }}
+          HUBSPOT_TOKEN:                ${{ secrets.HUBSPOT_TOKEN }}
+          GMAIL_ADDRESS:                ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD:           ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL:              ${{ secrets.RECIPIENT_EMAIL }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          CLICKUP_TOKEN:               ${{ secrets.CLICKUP_TOKEN }}
-          GROQ_API_KEY:                ${{ secrets.GROQ_API_KEY }}
+          CLICKUP_TOKEN:                ${{ secrets.CLICKUP_TOKEN }}
+          GROQ_API_KEY:                 ${{ secrets.GROQ_API_KEY }}
         run: python scripts/daily_report_v2.py

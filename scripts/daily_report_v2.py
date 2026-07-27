@@ -29,23 +29,12 @@ HUBSPOT_TOKEN      = os.environ['HUBSPOT_TOKEN']
 GMAIL_ADDRESS      = os.environ['GMAIL_ADDRESS']
 GMAIL_APP_PASSWORD = os.environ['GMAIL_APP_PASSWORD']
 RECIPIENT_EMAIL    = os.environ['RECIPIENT_EMAIL']
-APOLLO_API_KEY     = os.environ['APOLLO_API_KEY']
 GOOGLE_SA_JSON     = json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT_JSON'])
 CLICKUP_TOKEN      = os.environ['CLICKUP_TOKEN']
 CLICKUP_LIST_ID    = '901615411023'
 GROQ_API_KEY       = os.environ['GROQ_API_KEY']
 
 HUBSPOT_HEADERS = {'Authorization': f'Bearer {HUBSPOT_TOKEN}'}
-APOLLO_BASE    = 'https://api.apollo.io/api/v1'
-APOLLO_HEADERS = {
-    'Content-Type': 'application/json',
-    'Cache-Control': 'no-cache',
-    'X-Api-Key': APOLLO_API_KEY,
-}
-APOLLO_REPLY_CLASSES = [
-    'willing_to_meet', 'follow_up_question', 'person_referral',
-    'out_of_office', 'not_interested', 'unsubscribe',
-]
 BASE = 'https://api.hubapi.com'
 NOW  = datetime.now(timezone.utc)
 IST  = timezone(timedelta(hours=5, minutes=30))
@@ -511,133 +500,6 @@ def build_report_data(companies, deals, meetings_week,
     }
 
 
-# ── Apollo ────────────────────────────────────────────────────────────────────
-
-def _apollo_seq_detail(seq_id):
-    r = requests.get(f'{APOLLO_BASE}/emailer_campaigns/{seq_id}', headers=APOLLO_HEADERS)
-    return r.json().get('emailer_campaign', {}) if r.status_code == 200 else {}
-
-
-def _fetch_messages(seq_id, stat_filter=None):
-    msgs, page = [], 1
-    while page <= 50:
-        params = [('emailer_campaign_ids[]', seq_id), ('per_page', 100), ('page', page)]
-        if stat_filter:
-            params.append(('emailer_message_stats[]', stat_filter))
-        r = requests.get(f'{APOLLO_BASE}/emailer_messages/search',
-                         headers=APOLLO_HEADERS, params=params)
-        if r.status_code != 200:
-            break
-        batch = r.json().get('emailer_messages', [])
-        if not batch:
-            break
-        msgs.extend(batch)
-        if len(batch) < 100:
-            break
-        page += 1
-    return msgs
-
-
-def get_apollo_data():
-    try:
-        all_seqs, page = [], 1
-        while True:
-            r = requests.post(f'{APOLLO_BASE}/emailer_campaigns/search',
-                              headers=APOLLO_HEADERS,
-                              json={'per_page': 50, 'page': page})
-            if r.status_code != 200:
-                break
-            d     = r.json()
-            batch = d.get('emailer_campaigns', [])
-            if not batch:
-                break
-            all_seqs.extend(s for s in batch if not s.get('archived', False))
-            if len(batch) < 50:
-                break
-            page += 1
-
-        seqs    = sorted(all_seqs, key=lambda s: s.get('name', '').lower())
-        results = []
-
-        for seq in seqs:
-            sid        = str(seq['id'])
-            detail     = _apollo_seq_detail(sid)
-            steps_meta = detail.get('emailer_steps', [])
-            num_steps  = len(steps_meta) or seq.get('num_steps', 0)
-
-            uniq_delivered = detail.get('unique_delivered') or 0
-            uniq_opened    = detail.get('unique_opened') or 0
-            uniq_bounced   = detail.get('unique_bounced') or 0
-
-            step_stats = {
-                sm.get('position', i + 1): {
-                    'sent': 0, 'opened': 0, 'bounced': 0,
-                    'replied': 0, 'repliers': set(),
-                }
-                for i, sm in enumerate(steps_meta)
-            }
-
-            all_msgs = _fetch_messages(sid)
-
-            msg_compl_per_step = {}
-            for msg in all_msgs:
-                pos    = msg.get('campaign_position')
-                status = str(msg.get('status') or '').lower()
-                if pos not in step_stats:
-                    step_stats[pos] = {'sent': 0, 'opened': 0, 'bounced': 0,
-                                       'replied': 0, 'repliers': set()}
-                if status == 'completed' and not msg.get('spam_blocked'):
-                    msg_compl_per_step[pos] = msg_compl_per_step.get(pos, 0) + 1
-                if msg.get('replied') or msg.get('reply_class'):
-                    name = msg.get('to_name') or msg.get('to_email', 'Unknown')
-                    step_stats[pos]['repliers'].add(name)
-                    step_stats[pos]['replied'] += 1
-                    step_stats[pos]['opened']  += 1
-
-            total_compl = sum(msg_compl_per_step.values())
-            for pos, cnt in msg_compl_per_step.items():
-                ratio = cnt / total_compl if total_compl > 0 else 0
-                step_stats[pos]['sent']    = round(uniq_delivered * ratio)
-                step_stats[pos]['bounced'] = round(uniq_bounced   * ratio)
-
-            for pos, cnt in msg_compl_per_step.items():
-                ratio = cnt / total_compl if total_compl > 0 else 0
-                step_stats[pos]['opened'] = round(uniq_opened * ratio)
-            for pos, st in step_stats.items():
-                if st['replied'] > st['opened']:
-                    step_stats[pos]['opened'] = st['replied']
-
-            sorted_steps = sorted(
-                step_stats.items(),
-                key=lambda x: x[0] if isinstance(x[0], (int, float)) else 999
-            )
-            current_step = None
-            for pos, st in sorted_steps:
-                if st['sent'] > 0:
-                    current_step = pos
-
-            results.append({
-                'name':          seq.get('name', 'Unknown'),
-                'active':        seq.get('active', False),
-                'num_steps':     num_steps,
-                'current_step':  current_step,
-                'steps':         [{
-                    'step':     pos,
-                    'sent':     st['sent'],
-                    'opened':   st['opened'],
-                    'bounced':  st['bounced'],
-                    'replied':  st['replied'],
-                    'repliers': sorted(st['repliers']),
-                } for pos, st in sorted_steps],
-                'total_replied': sum(st['replied'] for _, st in sorted_steps),
-            })
-
-        return results
-    except Exception as e:
-        return [{'name': 'Apollo fetch failed', 'error': str(e),
-                 'active': False, 'num_steps': 0, 'current_step': None,
-                 'steps': [], 'total_replied': 0}]
-
 
 # ── HTML helpers ──────────────────────────────────────────────────────────────
 
@@ -855,79 +717,7 @@ def _clickup_html(tickets):
   </td></tr>'''
 
 
-def _apollo_html(apollo_data):
-    if not apollo_data:
-        return ''
-    cards = ''
-    for seq in apollo_data:
-        if 'error' in seq:
-            cards += (f'<div style="color:#dc2626;font-size:13px;padding:6px 0;">'
-                      f'Error: {seq["error"]}</div>')
-            continue
-        status_badge = (
-            '<span style="display:inline-block;padding:2px 9px;border-radius:10px;'
-            'background:#dcfce7;color:#166534;font-size:11px;font-weight:700;">Active</span>'
-            if seq['active'] else
-            '<span style="display:inline-block;padding:2px 9px;border-radius:10px;'
-            'background:#f1f5f9;color:#475569;font-size:11px;font-weight:700;">Paused</span>'
-        )
-        cur        = seq['current_step']
-        step_label = f'Step {cur} of {seq["num_steps"]}' if cur else f'{seq["num_steps"]} steps'
-
-        step_rows = ''
-        for s in seq['steps']:
-            pct = lambda n, d: f'{round(n / d * 100)}%' if d else '-'
-            open_pct   = pct(s['opened'],  s['sent'])
-            reply_pct  = pct(s['replied'], s['sent'])
-            bounce_pct = pct(s['bounced'], s['sent'])
-            replier_row = ''
-            if s['repliers']:
-                names = ', '.join(s['repliers'])
-                replier_row = (
-                    f'<tr><td colspan="7" style="padding:4px 16px 8px;font-size:11px;'
-                    f'color:#166534;background:#f0fdf4;font-style:italic;">'
-                    f'&#8627; Replied: {names}</td></tr>'
-                )
-            step_rows += (
-                f'<tr style="border-top:1px solid #f1f5f9;">'
-                f'<td style="padding:7px 12px;font-size:13px;color:#334155;">Step {s["step"]}</td>'
-                f'<td style="padding:7px 12px;font-size:13px;color:#0f2744;font-weight:600;text-align:center;">{s["sent"]}</td>'
-                f'<td style="padding:7px 12px;font-size:13px;color:#0f2744;font-weight:600;text-align:center;">{s["opened"]}</td>'
-                f'<td style="padding:7px 12px;font-size:12px;color:#64748b;text-align:center;">{open_pct}</td>'
-                f'<td style="padding:7px 12px;font-size:13px;color:#166534;font-weight:600;text-align:center;">{s["replied"]}</td>'
-                f'<td style="padding:7px 12px;font-size:12px;color:#64748b;text-align:center;">{reply_pct}</td>'
-                f'<td style="padding:7px 12px;font-size:12px;color:#b45309;text-align:center;">{s["bounced"]} ({bounce_pct})</td>'
-                f'</tr>{replier_row}'
-            )
-
-        cards += f'''
-<div style="border:1px solid #e2e8f0;border-radius:8px;margin-bottom:14px;overflow:hidden;">
-  <div style="background:#f8fafc;padding:11px 14px;display:flex;justify-content:space-between;align-items:center;">
-    <span style="font-size:13px;font-weight:700;color:#0f2744;">{seq["name"]}</span>
-    <span>{status_badge}&nbsp;&nbsp;<span style="font-size:12px;color:#64748b;">Currently on <strong style="color:#0f2744;">{step_label}</strong></span></span>
-  </div>
-  <table width="100%" cellpadding="0" cellspacing="0">
-    <tr style="background:#f8fafc;">
-      <th style="padding:6px 12px;font-size:11px;color:#94a3b8;text-align:left;font-weight:600;">STEP</th>
-      <th style="padding:6px 12px;font-size:11px;color:#94a3b8;text-align:center;font-weight:600;">DELIVERED</th>
-      <th style="padding:6px 12px;font-size:11px;color:#94a3b8;text-align:center;font-weight:600;">OPENED</th>
-      <th style="padding:6px 12px;font-size:11px;color:#94a3b8;text-align:center;font-weight:600;">OPEN %</th>
-      <th style="padding:6px 12px;font-size:11px;color:#94a3b8;text-align:center;font-weight:600;">REPLIED</th>
-      <th style="padding:6px 12px;font-size:11px;color:#94a3b8;text-align:center;font-weight:600;">REPLY %</th>
-      <th style="padding:6px 12px;font-size:11px;color:#94a3b8;text-align:center;font-weight:600;">BOUNCED</th>
-    </tr>
-    {step_rows}
-  </table>
-</div>'''
-    return f'''
-  <tr><td style="background:#fff;padding:0 32px;"><hr style="border:none;border-top:1px solid #f1f5f9;margin:0;"></td></tr>
-  <tr><td style="background:#fff;padding:24px 32px;">
-    <div style="font-size:12px;font-weight:700;color:#0f2744;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:16px;">&#9632; Email Sequences (Apollo)</div>
-    {cards}
-  </td></tr>'''
-
-
-def format_html(data, calendar_days, ai_briefing='', clickup_tickets=None, apollo_data=None):
+def format_html(data, calendar_days, ai_briefing='', clickup_tickets=None):
     stats = data['stats']
 
     def badge(text, color):
@@ -1048,8 +838,6 @@ def format_html(data, calendar_days, ai_briefing='', clickup_tickets=None, apoll
 
   {_clickup_html(clickup_tickets or [])}
 
-  {_apollo_html(apollo_data)}
-
   <tr><td style="background:#0f2744;border-radius:0 0 12px 12px;padding:16px 32px;text-align:center;">
     <div style="color:rgba(255,255,255,0.5);font-size:11px;">NirogGyan &nbsp;|&nbsp; Automated daily report &nbsp;|&nbsp; {data["date"]}</div>
   </td></tr>
@@ -1119,7 +907,7 @@ class PulsePDF(FPDF):
                   fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
 
-def format_pdf(data, calendar_days, ai_briefing='', clickup_tickets=None, apollo_data=None):
+def format_pdf(data, calendar_days, ai_briefing='', clickup_tickets=None):
     stats = data['stats']
 
     pdf = PulsePDF()
@@ -1277,48 +1065,6 @@ def format_pdf(data, calendar_days, ai_briefing='', clickup_tickets=None, apollo
                 (t['assignees'], 22),
             ], shade=(i % 2 == 1))
 
-    if apollo_data:
-        pdf.ln(4)
-        page_guard(40)
-        pdf.section_title('EMAIL SEQUENCES (APOLLO)')
-        for seq in apollo_data:
-            if 'error' in seq:
-                pdf.set_font('Helvetica', '', 9)
-                pdf.set_text_color(220, 38, 38)
-                pdf.cell(0, 7, pdf_safe(f'  Error: {seq["error"]}'),
-                         new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-                continue
-            page_guard(50)
-            status     = 'Active' if seq['active'] else 'Paused'
-            cur        = seq['current_step']
-            step_label = f'Step {cur} of {seq["num_steps"]}' if cur else f'{seq["num_steps"]} steps'
-            pdf.ln(3)
-            pdf.set_font('Helvetica', 'B', 10)
-            pdf.set_text_color(15, 39, 68)
-            pdf.cell(0, 7, pdf_safe(f'  {seq["name"]}  [{status}]  --  Currently on {step_label}'),
-                     new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            if seq['steps']:
-                pdf.tbl_header([
-                    ('Step', 25), ('Delivered', 28), ('Opened', 28), ('Open%', 22),
-                    ('Replied', 28), ('Reply%', 22), ('Bounced', 33),
-                ])
-                for i, s in enumerate(seq['steps']):
-                    pct = lambda n, d: f'{round(n / d * 100)}%' if d else '-'
-                    pdf.tbl_row([
-                        (f'Step {s["step"]}', 25),
-                        (str(s['sent']),    28),
-                        (str(s['opened']),  28),
-                        (pct(s['opened'],  s['sent']), 22),
-                        (str(s['replied']), 28),
-                        (pct(s['replied'], s['sent']), 22),
-                        (str(s['bounced']), 33),
-                    ], shade=(i % 2 == 1))
-                    if s['repliers']:
-                        names = ', '.join(s['repliers'])
-                        pdf.set_font('Helvetica', 'I', 8)
-                        pdf.set_text_color(22, 101, 52)
-                        pdf.multi_cell(0, 5, pdf_safe(f'    Replied: {names}'))
-
     return bytes(pdf.output())
 
 
@@ -1373,17 +1119,14 @@ if __name__ == '__main__':
     clickup_tickets = fetch_clickup_tickets()
     print(f'Got {len(clickup_tickets)} tickets\n')
 
-    print('Fetching Apollo sequence analytics...')
-    apollo_data = get_apollo_data()
-
     print('Generating AI briefing...')
     ai_briefing = build_ai_briefing(data, clickup_tickets, calendar_days)
     print(f'AI briefing: {ai_briefing[:80]}...\n')
 
     print('Generating HTML and PDF...')
     date_str = data['date']
-    html = format_html(data, calendar_days, ai_briefing=ai_briefing, clickup_tickets=clickup_tickets, apollo_data=apollo_data)
-    pdf  = format_pdf(data, calendar_days, ai_briefing=ai_briefing, clickup_tickets=clickup_tickets, apollo_data=apollo_data)
+    html = format_html(data, calendar_days, ai_briefing=ai_briefing, clickup_tickets=clickup_tickets)
+    pdf  = format_pdf(data, calendar_days, ai_briefing=ai_briefing, clickup_tickets=clickup_tickets)
 
     print('Sending email...')
     send_email(f"NirogGyan Daily Pulse - {date_str}", html, pdf, date_str)
