@@ -241,9 +241,13 @@ def build_ai_briefing(data, clickup_tickets, calendar_days):
         "",
         "INSTRUCTIONS:",
         "Write 4-6 short bullet points (use •) for a morning briefing. Each bullet should be 1-2 sentences max.",
-        "Focus on: what needs immediate action, risks, today's key meetings, patterns you see across the data.",
-        "Do NOT just list what's in the data — interpret it. Flag what's worrying, what's good, what needs follow-up.",
+        "Focus on: what needs immediate action, real risks, today's key meetings, and specific patterns you see across the data.",
+        "Do NOT just list what's in the data — interpret it. Only flag something as a risk or win if it is specific and backed by a concrete fact (a name, a number, a date).",
         "Be direct and specific. Use names, numbers, dates. No filler words. No intro sentence.",
+        "DO NOT include generic observations that aren't tied to a specific fact — no burnout/workload warnings about the team, "
+        "no vague encouragement like 'the team is doing well' or 'good momentum overall', and no restating a stat with no interpretation attached.",
+        "If the data is too thin or repetitive to say something specific and useful, write fewer bullets rather than padding with generic ones — "
+        "a short, sharp briefing beats a long, vague one.",
         "Plain text only, no markdown, no bold, no headers.",
     ]
 
@@ -307,6 +311,38 @@ def _week_label():
     return f'{WEEK_START.strftime("%d %b")} - {saturday.strftime("%d %b %Y")}'
 
 
+def _extract_custom_field_value(field):
+    """Pull a human-readable value out of a ClickUp custom field, regardless of type."""
+    val = field.get('value')
+    if val is None or val == '':
+        return ''
+    ftype = field.get('type', '')
+    if ftype in ('drop_down', 'labels'):
+        options = (field.get('type_config') or {}).get('options', [])
+        # drop_down: value is an index; labels: value is a list of indices
+        if isinstance(val, list):
+            names = []
+            for idx in val:
+                match = next((o.get('name') for o in options if o.get('orderindex') == idx), None)
+                if match:
+                    names.append(match)
+            return ', '.join(names)
+        match = next((o.get('name') for o in options if o.get('orderindex') == val), None)
+        return match or str(val)
+    return str(val)
+
+
+def _client_name_from_task(t):
+    """Look for a custom field named like 'client' or 'company' on the task."""
+    for field in t.get('custom_fields', []):
+        fname = (field.get('name') or '').lower()
+        if 'client' in fname or 'company' in fname:
+            value = _extract_custom_field_value(field)
+            if value:
+                return value.strip()
+    return ''
+
+
 def fetch_clickup_tickets():
     try:
         r = requests.get(
@@ -330,14 +366,23 @@ def fetch_clickup_tickets():
                 due_str   = due_dt.strftime('%d %b %Y')
             assignees = ', '.join(a['username'] for a in t.get('assignees', [])) or 'Unassigned'
             priority  = (t.get('priority') or {}).get('priority', '') or ''
+
+            # Client name comes from a ClickUp custom field (matched by name containing
+            # "client" or "company"). If the field isn't found/populated on a task,
+            # we fall back to "Unspecified" rather than guessing.
+            client_name = _client_name_from_task(t) or 'Unspecified'
+            is_internal = 'niro' in client_name.lower()
+
             result.append({
-                'name':      t['name'],
-                'status':    t['status']['status'],
-                'priority':  priority.upper(),
-                'due_str':   due_str,
-                'days_left': days_left,
-                'overdue':   overdue,
-                'assignees': assignees,
+                'name':        t['name'],
+                'status':      t['status']['status'],
+                'priority':    priority.upper(),
+                'due_str':     due_str,
+                'days_left':   days_left,
+                'overdue':     overdue,
+                'assignees':   assignees,
+                'client':      client_name,
+                'is_internal': is_internal,
             })
         # Sort: overdue first (oldest first), then by due date asc, then no-due-date
         def sort_key(t):
@@ -644,55 +689,68 @@ def _hs_meetings_html(hs_meetings_by_day, date_str):
 def _clickup_html(tickets):
     if not tickets:
         return ''
-    overdue_count = sum(1 for t in tickets if t['overdue'])
-    rows = ''
+    overdue_count  = sum(1 for t in tickets if t['overdue'])
+    internal_count = sum(1 for t in tickets if t['is_internal'])
+    external_count = len(tickets) - internal_count
+
+    # Cards instead of a rigid multi-column table — a 4-column table forces
+    # tiny fonts to fit on a phone screen; stacked cards resize naturally and
+    # give each ticket its own visual block (the "line break before tasks" ask).
+    cards = ''
     for t in tickets:
-        # Status badge
+        # Status badge — kept compact so an "in progress" ticket doesn't take
+        # any more vertical space than any other status.
         if t['status'].lower() == 'in progress':
             st_bg, st_fg = '#dbeafe', '#1d4ed8'
         else:
             st_bg, st_fg = '#f1f5f9', '#475569'
-        st_badge = (f'<span style="display:inline-block;padding:2px 8px;border-radius:10px;'
-                    f'background:{st_bg};color:{st_fg};font-size:10px;font-weight:700;">'
+        st_badge = (f'<span style="display:inline-block;padding:3px 9px;border-radius:10px;'
+                    f'background:{st_bg};color:{st_fg};font-size:11px;font-weight:700;">'
                     f'{t["status"].upper()}</span>')
 
-        # Priority badge
         pri_badge = ''
         if t['priority'] == 'URGENT':
-            pri_badge = ('<span style="display:inline-block;padding:2px 8px;border-radius:10px;'
-                         'background:#fee2e2;color:#b91c1c;font-size:10px;font-weight:700;margin-left:4px;">URGENT</span>')
+            pri_badge = ('<span style="display:inline-block;padding:3px 9px;border-radius:10px;'
+                         'background:#fee2e2;color:#b91c1c;font-size:11px;font-weight:700;margin-left:6px;">URGENT</span>')
         elif t['priority'] == 'HIGH':
-            pri_badge = ('<span style="display:inline-block;padding:2px 8px;border-radius:10px;'
-                         'background:#fef3c7;color:#92400e;font-size:10px;font-weight:700;margin-left:4px;">HIGH</span>')
+            pri_badge = ('<span style="display:inline-block;padding:3px 9px;border-radius:10px;'
+                         'background:#fef3c7;color:#92400e;font-size:11px;font-weight:700;margin-left:6px;">HIGH</span>')
         elif t['priority'] == 'NORMAL':
-            pri_badge = ('<span style="display:inline-block;padding:2px 8px;border-radius:10px;'
-                         'background:#f1f5f9;color:#475569;font-size:10px;font-weight:700;margin-left:4px;">NORMAL</span>')
+            pri_badge = ('<span style="display:inline-block;padding:3px 9px;border-radius:10px;'
+                         'background:#f1f5f9;color:#475569;font-size:11px;font-weight:700;margin-left:6px;">NORMAL</span>')
 
-        # Due date
         if not t['due_str']:
-            due_html = '<span style="color:#94a3b8;font-size:11px;">No due date</span>'
+            due_html = '<span style="color:#94a3b8;font-size:12px;">No due date</span>'
         elif t['overdue']:
-            due_html = (f'<span style="color:#b91c1c;font-weight:700;font-size:11px;">'
+            due_html = (f'<span style="color:#b91c1c;font-weight:700;font-size:12px;">'
                         f'{t["due_str"]} &nbsp;&#9888; {abs(t["days_left"])}d overdue</span>')
         elif t['days_left'] == 0:
-            due_html = f'<span style="color:#d97706;font-weight:700;font-size:11px;">{t["due_str"]} &nbsp;&#9888; Today</span>'
+            due_html = f'<span style="color:#d97706;font-weight:700;font-size:12px;">{t["due_str"]} &nbsp;&#9888; Today</span>'
         elif t['days_left'] <= 3:
-            due_html = f'<span style="color:#d97706;font-size:11px;">{t["due_str"]} ({t["days_left"]}d)</span>'
+            due_html = f'<span style="color:#d97706;font-size:12px;">{t["due_str"]} ({t["days_left"]}d)</span>'
         else:
-            due_html = f'<span style="color:#64748b;font-size:11px;">{t["due_str"]} ({t["days_left"]}d)</span>'
+            due_html = f'<span style="color:#64748b;font-size:12px;">{t["due_str"]} ({t["days_left"]}d)</span>'
 
-        row_bg = '#fff5f5' if t['overdue'] else '#ffffff'
-        rows += (
-            f'<tr style="background:{row_bg};">'
-            f'<td style="padding:8px 14px;border-bottom:1px solid #f1f5f9;font-size:12px;color:#1e293b;">'
-            f'{t["name"]}</td>'
-            f'<td style="padding:8px 14px;border-bottom:1px solid #f1f5f9;white-space:nowrap;">'
-            f'{st_badge}{pri_badge}</td>'
-            f'<td style="padding:8px 14px;border-bottom:1px solid #f1f5f9;">{due_html}</td>'
-            f'<td style="padding:8px 14px;border-bottom:1px solid #f1f5f9;font-size:11px;color:#64748b;">'
-            f'{t["assignees"]}</td>'
-            f'</tr>'
-        )
+        # Internal (Niro) vs external client — a colored left border + small
+        # tag makes this scannable at a glance, per team's request.
+        if t['is_internal']:
+            accent_color, client_bg, client_fg, client_label = '#1d4ed8', '#eff6ff', '#1d4ed8', 'INTERNAL'
+        else:
+            accent_color, client_bg, client_fg, client_label = '#166534', '#f0fdf4', '#166534', 'CLIENT'
+        card_bg = '#fff5f5' if t['overdue'] else '#ffffff'
+        client_tag = (f'<span style="display:inline-block;padding:2px 8px;border-radius:8px;'
+                      f'background:{client_bg};color:{client_fg};font-size:10px;font-weight:700;margin-right:6px;">'
+                      f'{client_label}</span>')
+
+        cards += f'''
+    <div style="background:{card_bg};border:1px solid #f1f5f9;border-left:4px solid {accent_color};
+                border-radius:6px;padding:12px 14px;margin-bottom:10px;">
+      <div style="font-size:14px;color:#1e293b;font-weight:600;line-height:1.4;margin-bottom:6px;">{t["name"]}</div>
+      <div style="font-size:12px;color:#334155;margin-bottom:6px;">{client_tag}<span style="font-weight:600;">{t["client"]}</span></div>
+      <div style="margin-bottom:6px;">{st_badge}{pri_badge}</div>
+      <div style="margin-bottom:4px;">{due_html}</div>
+      <div style="font-size:12px;color:#64748b;">Assigned: {t["assignees"]}</div>
+    </div>'''
 
     overdue_note = ''
     if overdue_count:
@@ -703,17 +761,13 @@ def _clickup_html(tickets):
     return f'''
   <tr><td style="background:#fff;padding:0 32px;"><hr style="border:none;border-top:1px solid #f1f5f9;margin:0;"></td></tr>
   <tr><td style="background:#fff;padding:24px 32px;">
-    <div style="font-size:12px;font-weight:700;color:#0f2744;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:14px;">
+    <div style="font-size:12px;font-weight:700;color:#0f2744;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:6px;">
       &#9632; Customer Support — Active Tickets ({len(tickets)}){overdue_note}
     </div>
-    <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #fecaca;border-radius:8px;overflow:hidden;">
-      <tr style="background:#fef2f2;">
-        <th style="padding:7px 14px;font-size:11px;color:#64748b;text-align:left;font-weight:600;">Task</th>
-        <th style="padding:7px 14px;font-size:11px;color:#64748b;text-align:left;font-weight:600;">Status / Priority</th>
-        <th style="padding:7px 14px;font-size:11px;color:#64748b;text-align:left;font-weight:600;">Due Date</th>
-        <th style="padding:7px 14px;font-size:11px;color:#64748b;text-align:left;font-weight:600;">Assignee(s)</th>
-      </tr>{rows}
-    </table>
+    <div style="font-size:11px;color:#64748b;margin-bottom:14px;">
+      {internal_count} internal (Niro) &nbsp;&middot;&nbsp; {external_count} external (client)
+    </div>
+    {cards}
   </td></tr>'''
 
 
@@ -775,9 +829,26 @@ def format_html(data, calendar_days, ai_briefing='', clickup_tickets=None):
             f'</tr>'
         )
 
+    def slab_header(label, color):
+        return (f'<tr><td style="background:{color};padding:10px 32px;">'
+                f'<div style="color:#ffffff;font-size:11px;font-weight:700;text-transform:uppercase;'
+                f'letter-spacing:2px;">{label}</div></td></tr>')
+
     return f'''<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  @media only screen and (max-width:480px) {{
+    body {{ padding:8px !important; }}
+    table[width="100%"] td {{ padding-left:16px !important; padding-right:16px !important; }}
+    div {{ font-size:inherit; }}
+    /* Bump up the smallest text sizes so nothing is unreadably tiny on a phone */
+    .mobile-text-sm  {{ font-size:13px !important; }}
+    .mobile-text-md  {{ font-size:15px !important; }}
+  }}
+</style>
+</head>
 <body style="margin:0;padding:20px;background:#f1f5f9;font-family:Arial,Helvetica,sans-serif;">
 <table width="100%" cellpadding="0" cellspacing="0" style="max-width:720px;margin:0 auto;">
 
@@ -807,9 +878,13 @@ def format_html(data, calendar_days, ai_briefing='', clickup_tickets=None):
     </tr></table>
   </td></tr>
 
+  {slab_header('&#9812; Founder Overview', '#0f2744')}
+
   {_ai_briefing_html(ai_briefing)}
 
   {_calendar_html(calendar_days)}
+
+  {slab_header('&#128188; Sales Team', '#1a56a0')}
 
   {_hs_meetings_html(data["hs_meetings_by_day"], data["date"])}
 
@@ -835,6 +910,8 @@ def format_html(data, calendar_days, ai_briefing='', clickup_tickets=None):
       </tr>{company_rows}
     </table>
   </td></tr>
+
+  {slab_header('&#127919; Support Team', '#166534') if clickup_tickets else ''}
 
   {_clickup_html(clickup_tickets or [])}
 
@@ -884,13 +961,15 @@ class PulsePDF(FPDF):
             self.cell(w, 7, pdf_safe(col), fill=True, border='B')
         self.ln()
 
-    def tbl_row(self, cells, shade=False):
-        if shade:
+    def tbl_row(self, cells, shade=False, row_color=None):
+        if row_color:
+            self.set_fill_color(*row_color)
+        elif shade:
             self.set_fill_color(252, 252, 253)
         self.set_font('Helvetica', '', 9)
         self.set_text_color(30, 41, 59)
         for text, w in cells:
-            self.cell(w, 6, pdf_safe(str(text)[:52]), fill=shade)
+            self.cell(w, 6, pdf_safe(str(text)[:52]), fill=(shade or bool(row_color)))
         self.ln()
 
     def day_header(self, label, is_today):
@@ -960,6 +1039,12 @@ def format_pdf(data, calendar_days, ai_briefing='', clickup_tickets=None):
         except Exception:
             return '-'
 
+    pdf.set_fill_color(15, 39, 68)
+    pdf.set_font('Helvetica', 'B', 9)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(0, 7, '  FOUNDER OVERVIEW', fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(2)
+
     # Google Calendar section
     if calendar_days:
         wl = _week_label()
@@ -986,6 +1071,11 @@ def format_pdf(data, calendar_days, ai_briefing='', clickup_tickets=None):
         wl = _week_label()
         pdf.ln(4)
         page_guard()
+        pdf.set_fill_color(26, 86, 160)
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(0, 7, '  SALES TEAM', fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(2)
         pdf.section_title(f'HUBSPOT MEETINGS — {wl}')
         for day_label, meetings in hs_by_day:
             is_today = (day_label == TODAY_LABEL)
@@ -1044,12 +1134,26 @@ def format_pdf(data, calendar_days, ai_briefing='', clickup_tickets=None):
     if clickup_tickets:
         pdf.ln(4)
         page_guard()
-        overdue_count = sum(1 for t in clickup_tickets if t['overdue'])
+        pdf.set_fill_color(22, 101, 52)
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(0, 7, '  SUPPORT TEAM', fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(2)
+
+        overdue_count  = sum(1 for t in clickup_tickets if t['overdue'])
+        internal_count = sum(1 for t in clickup_tickets if t['is_internal'])
+        external_count = len(clickup_tickets) - internal_count
         title = f'CUSTOMER SUPPORT — ACTIVE TICKETS ({len(clickup_tickets)})'
         if overdue_count:
             title += f'  [{overdue_count} OVERDUE]'
         pdf.section_title(title)
-        pdf.tbl_header([('Task', 90), ('Status', 24), ('Priority', 22), ('Due Date', 28), ('Assignee(s)', 22)])
+        pdf.set_font('Helvetica', 'I', 8)
+        pdf.set_text_color(100, 116, 139)
+        pdf.cell(0, 6, pdf_safe(f'  {internal_count} internal (Niro)  /  {external_count} external (client)'),
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(1)
+
+        pdf.tbl_header([('Task', 62), ('Client', 34), ('Status', 22), ('Priority', 20), ('Due Date', 26), ('Assignee(s)', 22)])
         for i, t in enumerate(clickup_tickets):
             if not t['due_str']:
                 due_label = 'No date'
@@ -1057,13 +1161,17 @@ def format_pdf(data, calendar_days, ai_briefing='', clickup_tickets=None):
                 due_label = f'{t["due_str"]} OVR'
             else:
                 due_label = t['due_str']
+            # Light blue tint for internal (Niro) tickets, light green for external clients —
+            # mirrors the color flag used in the HTML email version.
+            row_color = (235, 245, 255) if t['is_internal'] else (240, 253, 244)
             pdf.tbl_row([
-                (t['name'], 90),
-                (t['status'].upper(), 24),
-                (t['priority'] or '-', 22),
-                (due_label, 28),
+                (t['name'], 62),
+                (t['client'], 34),
+                (t['status'].upper(), 22),
+                (t['priority'] or '-', 20),
+                (due_label, 26),
                 (t['assignees'], 22),
-            ], shade=(i % 2 == 1))
+            ], row_color=row_color)
 
     return bytes(pdf.output())
 
