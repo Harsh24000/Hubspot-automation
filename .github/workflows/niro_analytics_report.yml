@@ -1,0 +1,30 @@
+name: Niro Health Analytics Report
+
+on:
+  workflow_dispatch:
+
+jobs:
+  send-analytics-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install cryptography
+
+      - name: Run analytics report
+        env:
+          CLARITY_TOKEN:               ${{ secrets.CLARITY_TOKEN }}
+          CLARITY_PROJECT_ID:          ${{ secrets.CLARITY_PROJECT_ID }}
+          GA4_PROPERTY_ID:             ${{ secrets.GA4_PROPERTY_ID }}
+          GA4_SERVICE_ACCOUNT_JSON:    ${{ secrets.GA4_SERVICE_ACCOUNT_JSON }}
+          GMAIL_ADDRESS:               ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD:          ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL:             ${{ secrets.RECIPIENT_EMAIL }}
+        run: python scripts/niro_analytics_report.py
