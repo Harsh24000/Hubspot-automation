@@ -1,0 +1,28 @@
+name: ClickUp Daily Updates Mail
+
+on:
+  workflow_dispatch:
+
+jobs:
+  send-standup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run standup mailer
+        env:
+          CLICKUP_TOKEN:      ${{ secrets.CLICKUP_TOKEN }}
+          CLICKUP_WORKSPACE:  ${{ secrets.CLICKUP_WORKSPACE }}
+          EMAIL_FROM:         ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO:           ${{ secrets.RECIPIENT_EMAIL }}
+        run: python scripts/clickup_dailymail/main.py
