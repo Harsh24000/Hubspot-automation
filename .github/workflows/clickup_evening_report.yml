@@ -34,6 +34,6 @@ jobs:
           CLICKUP_TOKEN:      ${{ secrets.CLICKUP_TOKEN }}
           CLICKUP_WORKSPACE:  ${{ secrets.CLICKUP_WORKSPACE }}
           EMAIL_FROM:         ${{ secrets.GMAIL_ADDRESS }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_PASSWORD:     ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_TO:           ${{ secrets.CLICKUP_MAIL_RECIPIENTS }}
         run: python main_evening.py
