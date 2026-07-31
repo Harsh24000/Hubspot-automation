@@ -24,5 +24,5 @@ jobs:
           CLICKUP_WORKSPACE:  ${{ secrets.CLICKUP_WORKSPACE }}
           EMAIL_FROM:         ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          EMAIL_TO:           ${{ secrets.RECIPIENT_EMAIL }}
+          EMAIL_TO:           ${{ secrets.CLICKUP_MAIL_RECIPIENTS }}
         run: python scripts/clickup_dailymail/main.py

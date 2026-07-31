@@ -158,9 +158,14 @@ def send_email(html_content: str, subject: str, cfg: dict) -> None:
 
     msg.attach(MIMEText(html_content, "html"))
 
-    recipients = [cfg["to"]] + ([cfg["cc"]] if cfg.get("cc") else [])
+    # cfg["to"] / cfg["cc"] may be a single address or a comma-separated list —
+    # split into a real list so every address actually gets the email, not
+    # just the first one.
+    to_list = [addr.strip() for addr in cfg["to"].split(",") if addr.strip()]
+    cc_list = [addr.strip() for addr in cfg.get("cc", "").split(",") if addr.strip()]
+    recipients = to_list + cc_list
 
-    print("Sending email via Gmail SMTP...")
+    print(f"Sending email via Gmail SMTP to: {', '.join(recipients)}")
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(cfg["from"], cfg["app_password"])
         server.sendmail(cfg["from"], recipients, msg.as_string())
