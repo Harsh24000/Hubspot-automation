@@ -4,6 +4,7 @@ Scans ClickUp tasks/subtasks for comments matching "est Xhr" posted today,
 then emails a formatted report grouped by assignee.
 """
 
+import json
 import os
 import re
 import smtplib
@@ -14,6 +15,8 @@ from datetime import date, datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Dict, List
+
+SNAPSHOT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "morning_snapshot.json")
 
 from clickup_client import ClickUpClient, this_week_ms
 from email_template import generate_email_html
@@ -118,6 +121,7 @@ def process_task(client: ClickUpClient, task: dict, person_tasks: Dict[str, List
                 "product_module": product_module,
                 "task_url": task.get("url", "#"),
                 "avatar": assignee.get("profilePicture"),
+                "user_id": assignee.get("id"),
             })
 
 
@@ -184,12 +188,11 @@ def main() -> None:
     email_to = os.environ.get("EMAIL_TO", "").strip()
     email_cc = os.environ.get("EMAIL_CC", "").strip()  # optional
 
-    # CLICKUP_TOKEN must be present before we can even attempt auto-detection.
     if not api_token:
         print("ERROR: Missing required environment variable: CLICKUP_TOKEN")
         sys.exit(1)
 
-    print(f"=== ClickUp Daily Standup — {date.today()} ===")
+    print(f"=== ClickUp Daily Updates — {date.today()} ===")
     client = ClickUpClient(api_token)
 
     # Auto-detect team_id if not explicitly set — must happen BEFORE the
@@ -234,6 +237,15 @@ def main() -> None:
         "to": email_to,
         "cc": email_cc,
     })
+
+    # Save snapshot for evening script
+    snapshot = {
+        "date": str(report_date),
+        "people": {name: tasks for name, tasks in person_tasks.items()},
+    }
+    with open(SNAPSHOT_PATH, "w") as f:
+        json.dump(snapshot, f)
+    print(f"Morning snapshot saved → {SNAPSHOT_PATH}")
 
 
 if __name__ == "__main__":

@@ -1,10 +1,10 @@
-name: ClickUp Daily Updates Mail
+name: ClickUp Evening Report
 
 on:
   workflow_dispatch:
 
 jobs:
-  send-standup:
+  send-report:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -21,7 +21,14 @@ jobs:
       - name: Set today's date
         run: echo "TODAY=$(date -u '+%Y-%m-%d')" >> $GITHUB_ENV
 
-      - name: Run standup mailer
+      - name: Restore morning snapshot
+        uses: actions/cache/restore@v4
+        with:
+          path: scripts/clickup_dailymail/morning_snapshot.json
+          key: morning-snapshot-${{ env.TODAY }}
+          fail-on-cache-miss: true
+
+      - name: Run evening report
         working-directory: scripts/clickup_dailymail
         env:
           CLICKUP_TOKEN:      ${{ secrets.CLICKUP_TOKEN }}
@@ -29,10 +36,4 @@ jobs:
           EMAIL_FROM:         ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_TO:           ${{ secrets.CLICKUP_MAIL_RECIPIENTS }}
-        run: python main.py
-
-      - name: Cache morning snapshot for evening script
-        uses: actions/cache/save@v4
-        with:
-          path: scripts/clickup_dailymail/morning_snapshot.json
-          key: morning-snapshot-${{ env.TODAY }}
+        run: python main_evening.py

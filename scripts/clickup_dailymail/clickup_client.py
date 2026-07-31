@@ -137,3 +137,17 @@ class ClickUpClient:
     def get_comments(self, task_id: str) -> List[Dict]:
         data = self._get(f"task/{task_id}/comment")
         return data.get("comments", [])
+
+    # ── Time tracking ────────────────────────────────────────────────────────
+
+    def get_time_entries(self, team_id: str, start_ms: int, end_ms: int, assignee_id: int = None) -> List[Dict]:
+        params = {"start_date": start_ms, "end_date": end_ms}
+        if assignee_id:
+            params["assignee"] = assignee_id
+        data = self._get(f"team/{team_id}/time_entries", params)
+        return data.get("data", [])
+
+    def get_workspace_members(self, team_id: str) -> List[Dict]:
+        data = self._get(f"team/{team_id}")
+        members = data.get("team", {}).get("members", [])
+        return [m.get("user", {}) for m in members]
