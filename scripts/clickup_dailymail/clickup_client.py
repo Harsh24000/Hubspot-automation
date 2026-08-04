@@ -77,12 +77,17 @@ class ClickUpClient:
 
     # ── Tasks ────────────────────────────────────────────────────────────────
 
-    def get_tasks(self, list_id: str, week_start_ms: int, week_end_ms: int) -> List[Dict]:
+    def get_tasks(self, list_id: str) -> List[Dict]:
         """
-        Phase 1 — fetch open root tasks due THIS week.
+        Phase 1 — fetch ALL open root tasks in the list (no due-date filter —
+                   many tasks have no due date set at all, and filtering on
+                   due_date silently excluded them from ever being scanned).
         Phase 2 — for each root task, explicitly fetch its open subtasks.
                    (ClickUp's subtasks=true silently drops subtasks created via
                    the task detail view; ?parent= is the only reliable route.)
+        The actual "is this relevant to today" filtering happens later, per-task,
+        based on whether a comment matching the est-hours pattern was posted today —
+        that's the correct filter; due date was never a reliable proxy for it.
         """
         tasks: List[Dict] = []
         seen: set = set()
@@ -92,14 +97,12 @@ class ClickUpClient:
                 seen.add(t["id"])
                 tasks.append(t)
 
-        # Phase 1 — open root tasks due this week
+        # Phase 1 — ALL open root tasks in the list, paginated
         root_ids: List[str] = []
         page = 0
         while True:
             data = self._get(f"list/{list_id}/task", {
                 "include_closed": False,
-                "due_date_gt": week_start_ms - 1,
-                "due_date_lt": week_end_ms,
                 "page": page,
             })
             batch = data.get("tasks", [])

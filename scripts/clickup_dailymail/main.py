@@ -11,14 +11,14 @@ import smtplib
 import sys
 import time
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Dict, List
 
 SNAPSHOT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "morning_snapshot.json")
 
-from clickup_client import ClickUpClient, this_week_ms
+from clickup_client import ClickUpClient
 from email_template import generate_email_html
 
 # Matches: est 4hr / est 4hrs / est 4h / est 30min / est 30mins / est 1.5hr
@@ -29,9 +29,15 @@ EST_PATTERN = re.compile(
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
 def _is_today(timestamp_ms: int) -> bool:
-    comment_date = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).date()
-    return comment_date == datetime.now(timezone.utc).date()
+    # Compare in IST, not UTC — the team works in IST, so a comment posted
+    # at, say, 1am IST is genuinely "today" for them even though it's still
+    # "yesterday" in UTC (UTC's day only rolls over at 5:30am IST).
+    comment_date = datetime.fromtimestamp(timestamp_ms / 1000, tz=IST).date()
+    return comment_date == datetime.now(IST).date()
 
 
 def _get_product_module(task: dict) -> str:
@@ -128,8 +134,6 @@ def process_task(client: ClickUpClient, task: dict, person_tasks: Dict[str, List
 def collect_tasks(client: ClickUpClient, team_id: str) -> Dict[str, List[dict]]:
     person_tasks: Dict[str, List[dict]] = defaultdict(list)
 
-    week_start_ms, week_end_ms = this_week_ms()
-
     spaces = client.get_spaces(team_id)
     print(f"Found {len(spaces)} space(s)")
 
@@ -140,7 +144,7 @@ def collect_tasks(client: ClickUpClient, team_id: str) -> Dict[str, List[dict]]:
 
         for lst in lists:
             print(f"    → List: {lst['name']}", end="", flush=True)
-            tasks = client.get_tasks(lst["id"], week_start_ms, week_end_ms)
+            tasks = client.get_tasks(lst["id"])
             print(f" ({len(tasks)} tasks)")
 
             for task in tasks:
