@@ -345,14 +345,24 @@ def _client_name_from_task(t):
 
 def fetch_clickup_tickets():
     try:
-        r = requests.get(
-            f'https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/task',
-            headers={'Authorization': CLICKUP_TOKEN},
-            timeout=15
-        )
-        if r.status_code != 200:
-            return []
-        tasks = r.json().get('tasks', [])
+        tasks = []
+        page = 0
+        while True:
+            r = requests.get(
+                f'https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/task',
+                headers={'Authorization': CLICKUP_TOKEN},
+                params={'page': page},
+                timeout=15
+            )
+            if r.status_code != 200:
+                break
+            data = r.json()
+            batch = data.get('tasks', [])
+            tasks.extend(batch)
+            # ClickUp signals the end either with an empty batch or last_page=True.
+            if not batch or data.get('last_page', True):
+                break
+            page += 1
         result = []
         for t in tasks:
             due_ms    = t.get('due_date')
