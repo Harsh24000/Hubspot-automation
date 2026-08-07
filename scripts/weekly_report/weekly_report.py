@@ -86,6 +86,18 @@ def _last_week_range_ms() -> tuple:
     return int(last_monday.timestamp() * 1000), int(last_sunday_end.timestamp() * 1000)
 
 
+def _last_week_display() -> str:
+    """e.g. 'Week of 28 Jul – 03 Aug 2026' — makes the reporting window explicit
+    rather than a vague 'last week', so it's clear exactly which 7 days this
+    report covers each time it runs."""
+    start_ms, end_ms = _last_week_range_ms()
+    start = datetime.fromtimestamp(start_ms / 1000, tz=IST)
+    end = datetime.fromtimestamp(end_ms / 1000, tz=IST)
+    if start.month == end.month:
+        return f"Week of {start.strftime('%d')}–{end.strftime('%d %b %Y')}"
+    return f"Week of {start.strftime('%d %b')} – {end.strftime('%d %b %Y')}"
+
+
 def _fmt_duration(ms: int) -> str:
     if not ms:
         return '0h'
@@ -260,6 +272,7 @@ def _section_title(label: str) -> str:
 
 def build_email_html(client_impl: dict, resource_tracking: dict, support: dict, overdue: list, report_date: date) -> str:
     today_str = report_date.strftime('%A, %B %d %Y')
+    week_label = _last_week_display()
 
     # ── Section 1: Client Implementation ──
     impl_html = ''
@@ -282,7 +295,7 @@ def build_email_html(client_impl: dict, resource_tracking: dict, support: dict, 
         <span style="display:inline-block;padding:3px 10px;border-radius:10px;background:{bg};color:{fg};font-size:11px;font-weight:700;">{data['status']}</span>
       </div>
       <div style="font-size:12px;color:#64748b;margin-bottom:10px;">
-        {data['task_count']} task(s) &middot; {_fmt_duration(data['duration_ms'])} tracked last week &middot; last activity {last_activity}
+        {data['task_count']} task(s) &middot; {_fmt_duration(data['duration_ms'])} tracked ({week_label}) &middot; last activity {last_activity}
       </div>
       <table width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #f1f5f9;">
         <tr><th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Resource</th>
@@ -351,9 +364,9 @@ def build_email_html(client_impl: dict, resource_tracking: dict, support: dict, 
 <table width="100%" cellpadding="0" cellspacing="0" style="max-width:720px;margin:0 auto;">
 
   <tr><td style="border-radius:20px 20px 0 0;overflow:hidden;background:linear-gradient(135deg,#0f2744 0%,#1a56a0 100%);padding:36px 32px;">
-    <div style="color:#dbeafe;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">Weekly Ops Report</div>
+    <div style="color:#dbeafe;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">Weekly Ops Report &middot; {week_label}</div>
     <div style="color:#fff;font-size:28px;font-weight:800;">Weekly Report</div>
-    <div style="color:rgba(255,255,255,0.7);font-size:14px;margin-top:4px;">{today_str}</div>
+    <div style="color:rgba(255,255,255,0.7);font-size:14px;margin-top:4px;">Sent {today_str}</div>
   </td></tr>
   <tr><td style="height:4px;background:linear-gradient(90deg,#6366F1,#A855F7,#EC4899);"></td></tr>
 
@@ -431,13 +444,15 @@ def main() -> None:
 
     print('=== Weekly ClickUp Ops Report ===\n')
 
-    print('Fetching open tasks workspace-wide...')
-    open_tasks = fetch_workspace_tasks(client, team_id, include_closed=False)
-    print(f'Total open tasks: {len(open_tasks)}\n')
-
-    print('Fetching ALL tasks (open + closed) workspace-wide, for client implementation status...')
+    print('Fetching ALL tasks (open + closed) workspace-wide — single pass, used for every section...')
     all_tasks = fetch_workspace_tasks(client, team_id, include_closed=True)
     print(f'Total tasks (all): {len(all_tasks)}\n')
+
+    # Derive the open subset locally instead of re-scanning the whole workspace
+    # a second time — that doubled every API call and made rate-limit-driven
+    # silent data loss far more likely.
+    open_tasks = [t for t in all_tasks if t.get('status', {}).get('type') != 'closed']
+    print(f'Open tasks (derived from the single pass above): {len(open_tasks)}\n')
 
     print('Fetching support tickets (open + closed)...')
     support_tickets = fetch_support_tickets(client)
@@ -458,7 +473,7 @@ def main() -> None:
 
     report_date = date.today()
     html = build_email_html(client_impl, resource_tracking, support, overdue, report_date)
-    subject = f'Weekly Ops Report — {report_date.strftime("%d %b %Y")}'
+    subject = f'Weekly Ops Report — {_last_week_display()}'
 
     send_email(html, subject, {
         'from': gmail_from,
