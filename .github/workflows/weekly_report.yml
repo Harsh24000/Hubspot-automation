@@ -1,0 +1,29 @@
+name: Weekly ClickUp Ops Report
+
+on:
+  workflow_dispatch:
+
+jobs:
+  send-weekly-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run weekly report
+        working-directory: scripts/weekly_report
+        env:
+          CLICKUP_TOKEN:      ${{ secrets.CLICKUP_TOKEN }}
+          CLICKUP_WORKSPACE:  ${{ secrets.CLICKUP_WORKSPACE }}
+          GMAIL_ADDRESS:      ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO:           ${{ secrets.WEEKLY_REPORT_RECIPIENTS }}
+        run: python weekly_report.py
