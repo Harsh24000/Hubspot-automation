@@ -35,17 +35,17 @@ class ClickUpClient:
             time.sleep(wait)
 
         url = f"{CLICKUP_BASE}/{path}"
-        for attempt in range(3):
+        for attempt in range(5):
             self._last_call_at = time.time()
             resp = self.session.get(url, params=params)
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", 60))
-                print(f"  Rate limited — waiting {retry_after}s...")
+                print(f"  Rate limited — waiting {retry_after}s... (attempt {attempt + 1}/5)")
                 time.sleep(retry_after)
                 continue
             resp.raise_for_status()
             return resp.json()
-        raise RuntimeError(f"Failed after 3 attempts: GET {path}")
+        raise RuntimeError(f"Failed after 5 attempts: GET {path}")
 
     # ── Workspace ────────────────────────────────────────────────────────────
 
@@ -119,7 +119,13 @@ class ClickUpClient:
                 break
             page += 1
 
-        # Phase 2 — recursively fetch subtasks at all depths
+        # Phase 2 — recursively fetch subtasks at all depths.
+        # If this fails after retries (rate-limit exhaustion, network error),
+        # we now LOG it instead of silently dropping the subtree — a silent
+        # `except: pass` here was the root cause of tasks/people vanishing
+        # from reports with no trace of why.
+        dropped = {'count': 0}
+
         def _fetch_children(parent_id: str) -> None:
             try:
                 data = self._get(f"list/{list_id}/task", {
@@ -130,11 +136,15 @@ class ClickUpClient:
                     if sub["id"] not in seen:
                         _add(sub)
                         _fetch_children(sub["id"])
-            except Exception:
-                pass
+            except Exception as exc:
+                dropped['count'] += 1
+                print(f"    [warn] Could not fetch subtasks of {parent_id}: {exc}")
 
         for parent_id in root_ids:
             _fetch_children(parent_id)
+
+        if dropped['count']:
+            print(f"  [warn] {dropped['count']} subtask branch(es) failed to fetch for list {list_id} — data may be incomplete.")
 
         return tasks
 
