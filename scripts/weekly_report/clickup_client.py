@@ -77,12 +77,20 @@ class ClickUpClient:
 
     # ── Tasks ────────────────────────────────────────────────────────────────
 
-    def get_tasks(self, list_id: str, week_start_ms: int, week_end_ms: int) -> List[Dict]:
+    def get_tasks(self, list_id: str, include_closed: bool = False) -> List[Dict]:
         """
-        Phase 1 — fetch open root tasks due THIS week.
+        Phase 1 — fetch ALL root tasks in the list (no due-date filter —
+                   many tasks have no due date set at all, and filtering on
+                   due_date silently excluded them from ever being scanned).
+                   By default only open tasks; pass include_closed=True to
+                   also pull closed/resolved tasks (needed for reports that
+                   count resolved vs. pending, e.g. support ticket rollups).
         Phase 2 — for each root task, explicitly fetch its open subtasks.
                    (ClickUp's subtasks=true silently drops subtasks created via
                    the task detail view; ?parent= is the only reliable route.)
+        The actual "is this relevant to today" filtering happens later, per-task,
+        based on whether a comment matching the est-hours pattern was posted today —
+        that's the correct filter; due date was never a reliable proxy for it.
         """
         tasks: List[Dict] = []
         seen: set = set()
@@ -92,14 +100,12 @@ class ClickUpClient:
                 seen.add(t["id"])
                 tasks.append(t)
 
-        # Phase 1 — open root tasks due this week
+        # Phase 1 — ALL root tasks in the list, paginated
         root_ids: List[str] = []
         page = 0
         while True:
             data = self._get(f"list/{list_id}/task", {
-                "include_closed": False,
-                "due_date_gt": week_start_ms - 1,
-                "due_date_lt": week_end_ms,
+                "include_closed": include_closed,
                 "page": page,
             })
             batch = data.get("tasks", [])
@@ -118,7 +124,7 @@ class ClickUpClient:
             try:
                 data = self._get(f"list/{list_id}/task", {
                     "parent": parent_id,
-                    "include_closed": False,
+                    "include_closed": include_closed,
                 })
                 for sub in data.get("tasks", []):
                     if sub["id"] not in seen:
@@ -137,3 +143,17 @@ class ClickUpClient:
     def get_comments(self, task_id: str) -> List[Dict]:
         data = self._get(f"task/{task_id}/comment")
         return data.get("comments", [])
+
+    # ── Time tracking ────────────────────────────────────────────────────────
+
+    def get_time_entries(self, team_id: str, start_ms: int, end_ms: int, assignee_id: int = None) -> List[Dict]:
+        params = {"start_date": start_ms, "end_date": end_ms}
+        if assignee_id:
+            params["assignee"] = assignee_id
+        data = self._get(f"team/{team_id}/time_entries", params)
+        return data.get("data", [])
+
+    def get_workspace_members(self, team_id: str) -> List[Dict]:
+        data = self._get(f"team/{team_id}")
+        members = data.get("team", {}).get("members", [])
+        return [m.get("user", {}) for m in members]
