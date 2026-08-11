@@ -5,22 +5,26 @@ Runs every Monday morning (triggered externally via cron-job.org → GitHub Acti
 
 Four sections, each covering the workspace as a whole (not just one list):
 
-1. Client Implementation — tasks tagged with a "Client" custom field, grouped
-   by client. Shows a derived status, time tracked last week, last activity,
-   and a per-resource breakdown.
-2. Resource → Project Tracking — every open task, grouped by assignee, showing
-   task name, due date, and project (ClickUp List) name.
+1. Client Implementation — tasks in an "Active Onboardings" list, tagged with
+   a "Client" custom field, grouped by client. Shows a derived status, time
+   tracked this reporting week, last activity, and a per-resource breakdown
+   (Resource, Product Module, Tracked Time).
+2. Resource → Product Module Tracking — every open task, grouped by assignee,
+   showing task name, due date, and Product Module (a ClickUp custom field).
 3. Customer Support — tickets from the Customer Support list (same list the
    daily report reads), grouped by client: total / resolved / pending counts,
    tracked time, and assigned resource(s).
-4. Overdue Tasks — every open task across the workspace past its due date.
+4. Overdue Tasks — every open task across the workspace past its due date,
+   showing the task's Product Module instead of its List/Project.
 
-ASSUMPTIONS (stated up front since ClickUp has no literal "Project" object):
-- "Project" = the ClickUp List name a task belongs to.
+ASSUMPTIONS:
 - "Resource" = the task's assignee.
+- "Product Module" = a custom field whose name contains "module" or "product".
 - "Client" = a custom field whose name contains "client" or "company".
-- "Tracked time" = time logged via ClickUp time tracking, for last week
-  (Monday 00:00 IST through Sunday 23:59 IST, the week before this run).
+- "Active Onboardings" scope = any list whose name contains "onboarding"
+  (case-insensitive) — client implementation only counts tasks living there.
+- "Tracked time" = time logged via ClickUp time tracking, for this reporting
+  week (Monday 00:00 IST through Sunday 23:59 IST, the week before this run).
 - Client Implementation "Status" is a heuristic: all tasks closed → Completed;
   none started → Not Started; anything else → In Progress.
 """
@@ -68,6 +72,33 @@ def _client_name_from_task(task: dict) -> str:
 
 def _project_name(task: dict) -> str:
     return (task.get('list') or {}).get('name', 'Unknown')
+
+
+def _product_module_name(task: dict) -> str:
+    """Extract 'Product Module' from a custom field (drop_down, text, or labels type)."""
+    for field in task.get('custom_fields', []):
+        name_lower = (field.get('name') or '').lower()
+        if 'module' not in name_lower and 'product' not in name_lower:
+            continue
+        value = field.get('value')
+        if value is None or value == '':
+            continue
+        field_type = field.get('type', '')
+        if field_type == 'drop_down':
+            options = (field.get('type_config') or {}).get('options', [])
+            for opt in options:
+                if str(opt.get('orderindex', '')) == str(value) or opt.get('id') == str(value):
+                    return opt.get('name', str(value))
+            try:
+                return options[int(value)]['name']
+            except (IndexError, ValueError, TypeError):
+                return str(value)
+        if field_type == 'labels':
+            options = (field.get('type_config') or {}).get('options', [])
+            matched = [o['name'] for o in options if o.get('id') in (value or [])]
+            return ', '.join(matched) if matched else 'N/A'
+        return str(value).strip() or 'N/A'
+    return 'N/A'
 
 
 def _assignees(task: dict) -> list:
@@ -166,6 +197,12 @@ def fetch_time_by_task(client: ClickUpClient, team_id: str) -> dict:
 def build_client_implementation(all_tasks: list, task_ms: dict) -> dict:
     by_client = defaultdict(list)
     for t in all_tasks:
+        # Only tasks in an "Active Onboardings" list count as client
+        # implementation work — everything else (support, internal, etc.)
+        # is out of scope for this section even if it happens to carry a
+        # Client custom field.
+        if 'onboarding' not in _project_name(t).lower():
+            continue
         client_name = _client_name_from_task(t)
         if not client_name or 'niro' in client_name.lower():
             continue  # only external client-tagged implementation work
@@ -190,7 +227,7 @@ def build_client_implementation(all_tasks: list, task_ms: dict) -> dict:
             for res in _assignees(t):
                 resources.append({
                     'resource': res,
-                    'project': _project_name(t),
+                    'product_module': _product_module_name(t),
                     'tracked_ms': task_ms.get(t['id'], 0),
                     'task_name': t.get('name', 'Untitled'),
                 })
@@ -215,7 +252,7 @@ def build_resource_project_tracking(open_tasks: list) -> dict:
                 'due_str': due_str,
                 'days_left': days_left,
                 'overdue': overdue,
-                'project': _project_name(t),
+                'product_module': _product_module_name(t),
                 'task_url': t.get('url', '#'),
             })
     return by_resource
@@ -248,7 +285,7 @@ def build_overdue(all_open_tasks: list) -> list:
         overdue.append({
             'task_name': t.get('name', 'Untitled'),
             'assignees': ', '.join(_assignees(t)),
-            'project': _project_name(t),
+            'product_module': _product_module_name(t),
             'due_str': due_str,
             'days_overdue': abs(days_left),
             'task_url': t.get('url', '#'),
@@ -284,7 +321,7 @@ def build_email_html(client_impl: dict, resource_tracking: dict, support: dict, 
                           .strftime('%d %b %Y') if data['last_activity_ms'] else 'Unknown')
         rows = ''.join(
             f'<tr><td style="padding:6px 10px;font-size:12px;color:#334155;">{r["resource"]}</td>'
-            f'<td style="padding:6px 10px;font-size:12px;color:#334155;">{r["project"]}</td>'
+            f'<td style="padding:6px 10px;font-size:12px;color:#334155;">{r["product_module"]}</td>'
             f'<td style="padding:6px 10px;font-size:12px;color:#334155;">{_fmt_duration(r["tracked_ms"])}</td></tr>'
             for r in data['resources']
         )
@@ -299,7 +336,7 @@ def build_email_html(client_impl: dict, resource_tracking: dict, support: dict, 
       </div>
       <table width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #f1f5f9;">
         <tr><th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Resource</th>
-            <th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Project</th>
+            <th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Product Module</th>
             <th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Tracked</th></tr>
         {rows}
       </table>
@@ -307,7 +344,7 @@ def build_email_html(client_impl: dict, resource_tracking: dict, support: dict, 
     if not impl_html:
         impl_html = '<div style="color:#94a3b8;font-size:13px;">No client-tagged implementation work found.</div>'
 
-    # ── Section 2: Resource → Project Tracking ──
+    # ── Section 2: Resource → Product Module Tracking ──
     tracking_html = ''
     for resource, tasks in sorted(resource_tracking.items()):
         rows = ''
@@ -316,14 +353,14 @@ def build_email_html(client_impl: dict, resource_tracking: dict, support: dict, 
             rows += (f'<tr><td style="padding:6px 10px;font-size:12px;color:#0f172a;">'
                      f'<a href="{t["task_url"]}" style="color:#0f172a;text-decoration:none;">{t["task_name"]}</a></td>'
                      f'<td style="padding:6px 10px;font-size:12px;color:{due_color};">{t["due_str"]}</td>'
-                     f'<td style="padding:6px 10px;font-size:12px;color:#64748b;">{t["project"]}</td></tr>')
+                     f'<td style="padding:6px 10px;font-size:12px;color:#64748b;">{t["product_module"]}</td></tr>')
         tracking_html += f'''
     <div style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:16px 18px;margin-bottom:12px;">
       <div style="font-size:14px;font-weight:700;color:#0f172a;margin-bottom:8px;">{resource} &middot; {len(tasks)} task(s)</div>
       <table width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #f1f5f9;">
         <tr><th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Task</th>
             <th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Due Date</th>
-            <th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Project</th></tr>
+            <th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Product Module</th></tr>
         {rows}
       </table>
     </div>'''
@@ -351,7 +388,7 @@ def build_email_html(client_impl: dict, resource_tracking: dict, support: dict, 
             f'<tr><td style="padding:8px 12px;font-size:12px;color:#0f172a;">'
             f'<a href="{t["task_url"]}" style="color:#0f172a;text-decoration:none;">{t["task_name"]}</a></td>'
             f'<td style="padding:8px 12px;font-size:12px;color:#64748b;">{t["assignees"]}</td>'
-            f'<td style="padding:8px 12px;font-size:12px;color:#64748b;">{t["project"]}</td>'
+            f'<td style="padding:8px 12px;font-size:12px;color:#64748b;">{t["product_module"]}</td>'
             f'<td style="padding:8px 12px;font-size:12px;color:#b91c1c;font-weight:700;">{t["days_overdue"]}d overdue</td></tr>'
         )
     if not overdue_rows:
@@ -373,7 +410,7 @@ def build_email_html(client_impl: dict, resource_tracking: dict, support: dict, 
   {_slab('&#128188; Client Implementation', '#7c3aed')}
   <tr><td style="background:#fff;padding:20px 32px;">{_section_title('Client Implementation — Status &amp; Last Activity')}{impl_html}</td></tr>
 
-  {_slab('&#128100; Resource → Project Tracking', '#1a56a0')}
+  {_slab('&#128100; Resource → Product Module Tracking', '#1a56a0')}
   <tr><td style="background:#fff;padding:20px 32px;">{_section_title('Open Tasks by Resource')}{tracking_html}</td></tr>
 
   {_slab('&#127919; Customer Support', '#166534')}
@@ -399,7 +436,7 @@ def build_email_html(client_impl: dict, resource_tracking: dict, support: dict, 
       <tr style="background:#fef2f2;">
         <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Task</th>
         <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Assignee</th>
-        <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Project</th>
+        <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Product Module</th>
         <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Overdue by</th>
       </tr>
       {overdue_rows}
