@@ -104,7 +104,17 @@ def _task_row_html(task: dict) -> str:
     </tr>"""
 
 
-def _person_section_html(name: str, tasks: List[dict]) -> str:
+def _fmt_hours(hours: float) -> str:
+    if hours <= 0:
+        return "0h"
+    if hours < 1:
+        return f"{round(hours * 60)}m"
+    if hours == int(hours):
+        return f"{int(hours)}h"
+    return f"{hours:.1f}h"
+
+
+def _person_section_html(name: str, tasks: List[dict], total_hours: float) -> str:
     avatar = _avatar_html(name, tasks[0].get("avatar") if tasks else None)
     task_rows = "".join(_task_row_html(t) for t in tasks)
     task_word = "task" if len(tasks) == 1 else "tasks"
@@ -118,14 +128,21 @@ def _person_section_html(name: str, tasks: List[dict]) -> str:
       <!-- Person header -->
       <tr>
         <td style="padding:20px 24px 16px 24px;border-bottom:1px solid #E2E8F0;">
-          <table cellpadding="0" cellspacing="0" border="0">
+          <table cellpadding="0" cellspacing="0" border="0" width="100%">
             <tr>
-              <td style="vertical-align:middle;padding-right:14px;">{avatar}</td>
+              <td style="vertical-align:middle;padding-right:14px;width:44px;">{avatar}</td>
               <td style="vertical-align:middle;">
                 <p style="margin:0;font-family:Arial,sans-serif;font-size:17px;
                            font-weight:700;color:#0F172A;">{name}</p>
                 <p style="margin:3px 0 0 0;font-family:Arial,sans-serif;font-size:12px;
                            color:#64748B;">{len(tasks)} {task_word} scheduled today</p>
+              </td>
+              <td style="vertical-align:middle;text-align:right;">
+                <span style="display:inline-block;padding:5px 12px;border-radius:12px;
+                             background:#EEF2FF;color:#4F46E5;font-size:13px;font-weight:700;
+                             font-family:Arial,sans-serif;white-space:nowrap;">
+                  &#8721; {_fmt_hours(total_hours)} today
+                </span>
               </td>
             </tr>
           </table>
@@ -142,14 +159,16 @@ def _person_section_html(name: str, tasks: List[dict]) -> str:
     </table>"""
 
 
-def generate_email_html(person_tasks: Dict[str, List[dict]], report_date: date) -> str:
+def generate_email_html(person_tasks: Dict[str, List[dict]], report_date: date, person_totals: Dict[str, float] = None) -> str:
     today_str = report_date.strftime("%A, %B %d %Y")
     day_label = report_date.strftime("%A").upper()
     total_people = len(person_tasks)
     total_tasks = sum(len(t) for t in person_tasks.values())
+    person_totals = person_totals or {}
+    grand_total_hours = sum(person_totals.values())
 
     person_sections = "".join(
-        _person_section_html(name, tasks)
+        _person_section_html(name, tasks, person_totals.get(name, 0.0))
         for name, tasks in sorted(person_tasks.items())
     )
 
@@ -215,6 +234,15 @@ def generate_email_html(person_tasks: Dict[str, List[dict]], report_date: date) 
                     <p style="margin:2px 0 0;font-family:Arial,sans-serif;font-size:11px;
                                font-weight:600;letter-spacing:1px;color:rgba(255,255,255,0.6);text-transform:uppercase;">
                       Tasks Scheduled
+                    </p>
+                  </td>
+                  <td style="width:1px;background:rgba(255,255,255,0.2);">&nbsp;</td>
+                  <td style="padding-left:24px;">
+                    <p style="margin:0;font-family:Arial,sans-serif;font-size:26px;
+                               font-weight:800;color:#FFFFFF;">{_fmt_hours(grand_total_hours)}</p>
+                    <p style="margin:2px 0 0;font-family:Arial,sans-serif;font-size:11px;
+                               font-weight:600;letter-spacing:1px;color:rgba(255,255,255,0.6);text-transform:uppercase;">
+                      Hours Estimated
                     </p>
                   </td>
                 </tr>
