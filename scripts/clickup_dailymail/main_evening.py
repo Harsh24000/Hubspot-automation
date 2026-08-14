@@ -31,6 +31,10 @@ def _today_range_ms() -> tuple:
     return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 
+def _is_sunday_ist() -> bool:
+    return datetime.now(IST).weekday() == 6  # Monday=0 ... Sunday=6
+
+
 def _format_duration(ms: int) -> str:
     total_minutes = int(ms) // 60000
     hours = total_minutes // 60
@@ -149,19 +153,22 @@ def build_report(client: ClickUpClient, snapshot: dict, time_entries: List[dict]
             "planned": planned,
             "unplanned": unplanned,
             "avatar": morning_tasks[0].get("avatar") if morning_tasks else None,
+            "total_logged_ms": sum(t["logged_ms"] for t in planned) + sum(t["logged_ms"] for t in unplanned),
         }
 
     # People who logged time today but had NO morning tasks
     for user, task_times in user_task_ms.items():
         if user in report:
             continue
+        unplanned_only = [
+            {**entry_task_meta[tid], "logged": _format_duration(ms), "logged_ms": ms}
+            for tid, ms in task_times.items()
+        ]
         report[user] = {
             "planned": [],
-            "unplanned": [
-                {**entry_task_meta[tid], "logged": _format_duration(ms), "logged_ms": ms}
-                for tid, ms in task_times.items()
-            ],
+            "unplanned": unplanned_only,
             "avatar": None,
+            "total_logged_ms": sum(t["logged_ms"] for t in unplanned_only),
         }
 
     return report
@@ -196,6 +203,12 @@ def send_email(html_content: str, subject: str, cfg: dict) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # No mail on Sundays — checked in IST (the team's timezone), not whatever
+    # timezone the GitHub Actions runner happens to be in (UTC).
+    if _is_sunday_ist():
+        print(f"Today ({datetime.now(IST).strftime('%A, %d %b %Y')}) is Sunday — skipping, no email sent.")
+        return
+
     api_token = (os.environ.get("CLICKUP_TOKEN") or "").strip()
     team_id = (os.environ.get("CLICKUP_WORKSPACE") or "").strip()
     gmail_from = (os.environ.get("EMAIL_FROM") or "").strip()
