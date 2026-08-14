@@ -40,6 +40,14 @@ EST_PATTERN = re.compile(
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+def _today_range_ms() -> tuple:
+    """(start_ms, end_ms) for today, midnight to 23:59:59 IST."""
+    now = datetime.now(IST)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+
+
 def _is_today(timestamp_ms: int) -> bool:
     # Compare in IST, not UTC — the team works in IST, so a comment posted
     # at, say, 1am IST is genuinely "today" for them even though it's still
@@ -184,6 +192,47 @@ def compute_person_totals(person_tasks: Dict[str, List[dict]]) -> Dict[str, floa
     }
 
 
+def fetch_person_logged_hours(client: ClickUpClient, team_id: str, person_tasks: Dict[str, List[dict]]) -> Dict[str, float]:
+    """
+    Actual time LOGGED today per person, via ClickUp's time tracker — distinct
+    from the estimated hours above, which come from parsing "est Xhr" comment
+    text. This queries ClickUp's time_entries endpoint directly.
+    """
+    # Get each person's ClickUp user_id from whatever tasks we already have
+    # for them (assignee id was captured in process_task); fall back to a
+    # full workspace member lookup for anyone missing it.
+    person_user_ids: Dict[str, int] = {}
+    for name, tasks in person_tasks.items():
+        for t in tasks:
+            if t.get("user_id"):
+                person_user_ids[name] = t["user_id"]
+                break
+
+    missing = [name for name in person_tasks if name not in person_user_ids]
+    if missing:
+        try:
+            members = client.get_workspace_members(team_id)
+            by_username = {m.get("username"): m.get("id") for m in members if m.get("username")}
+            for name in missing:
+                if name in by_username:
+                    person_user_ids[name] = by_username[name]
+        except Exception as exc:
+            print(f"  [warn] Could not fetch workspace members for logged-time lookup: {exc}")
+
+    start_ms, end_ms = _today_range_ms()
+    logged_hours: Dict[str, float] = {}
+    for name, uid in person_user_ids.items():
+        try:
+            entries = client.get_time_entries(team_id, start_ms, end_ms, assignee_id=uid)
+            total_ms = sum(int(e.get("duration", 0)) for e in entries if int(e.get("duration", 0)) > 0)
+            logged_hours[name] = total_ms / 3600000.0  # ms -> hours
+        except Exception as exc:
+            print(f"  [warn] Could not fetch time entries for {name}: {exc}")
+            logged_hours[name] = 0.0
+
+    return logged_hours
+
+
 # ── Email ────────────────────────────────────────────────────────────────────
 
 def send_email(html_content: str, subject: str, cfg: dict) -> None:
@@ -265,15 +314,21 @@ def main() -> None:
 
     person_totals = compute_person_totals(person_tasks)
 
+    print("Fetching actual logged time for today...")
+    person_logged_hours = fetch_person_logged_hours(client, team_id, person_tasks)
+
     total_tasks = sum(len(t) for t in person_tasks.values())
     grand_total_hours = sum(person_totals.values())
+    grand_logged_hours = sum(person_logged_hours.values())
     print(f"\nSummary: {len(person_tasks)} people, {total_tasks} tasks, "
-          f"{grand_total_hours:.1f}h estimated total")
+          f"{grand_total_hours:.1f}h estimated total, {grand_logged_hours:.1f}h logged total")
     for name, tasks in sorted(person_tasks.items()):
-        print(f"  {name}: {len(tasks)} task(s), {person_totals[name]:.1f}h estimated")
+        print(f"  {name}: {len(tasks)} task(s), {person_totals[name]:.1f}h estimated, "
+              f"{person_logged_hours.get(name, 0.0):.1f}h logged")
 
     report_date = date.today()
-    html = generate_email_html(person_tasks, report_date, person_totals=person_totals)
+    html = generate_email_html(person_tasks, report_date, person_totals=person_totals,
+                                person_logged_hours=person_logged_hours)
     subject = f"Daily Updates — {today_ist.strftime('%A, %b %d')}"
 
     send_email(html, subject, {
