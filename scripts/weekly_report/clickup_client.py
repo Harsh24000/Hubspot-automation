@@ -77,7 +77,7 @@ class ClickUpClient:
 
     # ── Tasks ────────────────────────────────────────────────────────────────
 
-    def get_tasks(self, list_id: str, include_closed: bool = False) -> List[Dict]:
+    def get_tasks(self, list_id: str, include_closed: bool = False, include_subtasks: bool = True) -> List[Dict]:
         """
         Phase 1 — fetch ALL root tasks in the list (no due-date filter —
                    many tasks have no due date set at all, and filtering on
@@ -85,9 +85,12 @@ class ClickUpClient:
                    By default only open tasks; pass include_closed=True to
                    also pull closed/resolved tasks (needed for reports that
                    count resolved vs. pending, e.g. support ticket rollups).
-        Phase 2 — for each root task, explicitly fetch its open subtasks.
+        Phase 2 — for each root task, explicitly fetch its subtasks.
                    (ClickUp's subtasks=true silently drops subtasks created via
                    the task detail view; ?parent= is the only reliable route.)
+                   Pass include_subtasks=False to skip this entirely and return
+                   only main/root-level tasks — also cuts API call volume a lot,
+                   since Phase 2 makes one call per root task.
         The actual "is this relevant to today" filtering happens later, per-task,
         based on whether a comment matching the est-hours pattern was posted today —
         that's the correct filter; due date was never a reliable proxy for it.
@@ -113,11 +116,15 @@ class ClickUpClient:
                 _add(t)
                 if not t.get("parent"):
                     root_ids.append(t["id"])
-                for sub in t.get("subtasks", []):   # handle if ClickUp does return them
-                    _add(sub)
+                if include_subtasks:
+                    for sub in t.get("subtasks", []):   # handle if ClickUp does return them
+                        _add(sub)
             if not batch or data.get("last_page", True):
                 break
             page += 1
+
+        if not include_subtasks:
+            return tasks
 
         # Phase 2 — recursively fetch subtasks at all depths.
         # If this fails after retries (rate-limit exhaustion, network error),
