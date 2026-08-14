@@ -3,30 +3,36 @@
 Weekly ClickUp Ops Report
 Runs every Monday morning (triggered externally via cron-job.org → GitHub Actions).
 
-Four sections, each covering the workspace as a whole (not just one list):
+Three sections, matching the team's own reference spreadsheet layout:
 
-1. Client Implementation — tasks in an "Active Onboardings" list, tagged with
-   a "Client" custom field, grouped by client. Shows a derived status, time
-   tracked this reporting week, last activity, and a per-resource breakdown
-   (Resource, Product Module, Tracked Time).
-2. Resource → Product Module Tracking — every open task, grouped by assignee,
-   showing task name, due date, and Product Module (a ClickUp custom field).
+1. Onboarding — tasks in an "Active Onboardings" list, tagged with a "Client"
+   custom field, grouped by client. Shows Client Name, Status (the current
+   status of that client's most recently updated task), Duration (days since
+   their earliest onboarding task was created), and Last Activity (relative,
+   e.g. "3 days ago"). No time-tracking figures in this section.
+2. Resource → Product Module Tracking — for each resource (assignee), every
+   product module they logged time against this week, with hours tracked,
+   plus a total-tracked-time badge at the top of their card.
 3. Customer Support — tickets from the Customer Support list (same list the
    daily report reads), grouped by client: total / resolved / pending counts,
    tracked time, and assigned resource(s).
-4. Overdue Tasks — every open task across the workspace past its due date,
-   showing the task's Product Module instead of its List/Project.
+
+Only ROOT tasks are scanned — subtasks are deliberately excluded (this also
+cuts API call volume substantially, which reduces rate-limit risk).
 
 ASSUMPTIONS:
 - "Resource" = the task's assignee.
 - "Product Module" = a custom field whose name contains "module" or "product".
 - "Client" = a custom field whose name contains "client" or "company".
 - "Active Onboardings" scope = any list whose name contains "onboarding"
-  (case-insensitive) — client implementation only counts tasks living there.
+  (case-insensitive) — the Onboarding section only counts tasks living there.
 - "Tracked time" = time logged via ClickUp time tracking, for this reporting
   week (Monday 00:00 IST through Sunday 23:59 IST, the week before this run).
-- Client Implementation "Status" is a heuristic: all tasks closed → Completed;
-  none started → Not Started; anything else → In Progress.
+- Onboarding "Status" = the ClickUp status of whichever of that client's
+  onboarding tasks was updated most recently (so it shows real status names
+  like "UAT", not a synthetic label).
+- "Duration" = whole days between the client's earliest onboarding task being
+  created and today.
 """
 
 import os
@@ -36,6 +42,7 @@ from collections import defaultdict
 from datetime import date, datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from typing import Dict, List
 
 from clickup_client import ClickUpClient
 
@@ -70,10 +77,6 @@ def _client_name_from_task(task: dict) -> str:
     return ''
 
 
-def _project_name(task: dict) -> str:
-    return (task.get('list') or {}).get('name', 'Unknown')
-
-
 def _product_module_name(task: dict) -> str:
     """Extract 'Product Module' from a custom field (drop_down, text, or labels type)."""
     for field in task.get('custom_fields', []):
@@ -101,6 +104,10 @@ def _product_module_name(task: dict) -> str:
     return 'N/A'
 
 
+def _project_name(task: dict) -> str:
+    return (task.get('list') or {}).get('name', 'Unknown')
+
+
 def _assignees(task: dict) -> list:
     names = [a.get('username') or a.get('email', '') for a in task.get('assignees', [])]
     return [n for n in names if n] or ['Unassigned']
@@ -118,15 +125,11 @@ def _last_week_range_ms() -> tuple:
 
 
 def _last_week_display() -> str:
-    """e.g. 'Week of 28 Jul – 03 Aug 2026' — makes the reporting window explicit
-    rather than a vague 'last week', so it's clear exactly which 7 days this
-    report covers each time it runs."""
+    """e.g. 'Monday 27 Jul – Sunday 02 Aug 2026' — explicit Monday-to-Sunday range."""
     start_ms, end_ms = _last_week_range_ms()
     start = datetime.fromtimestamp(start_ms / 1000, tz=IST)
     end = datetime.fromtimestamp(end_ms / 1000, tz=IST)
-    if start.month == end.month:
-        return f"Week of {start.strftime('%d')}–{end.strftime('%d %b %Y')}"
-    return f"Week of {start.strftime('%d %b')} – {end.strftime('%d %b %Y')}"
+    return f"Monday {start.strftime('%d %b')} – Sunday {end.strftime('%d %b %Y')}"
 
 
 def _fmt_duration(ms: int) -> str:
@@ -141,19 +144,36 @@ def _fmt_duration(ms: int) -> str:
     return f'{minutes}m'
 
 
-def _fmt_due(due_ms) -> tuple:
-    """Returns (display_str, days_left_or_None, is_overdue)."""
-    if not due_ms:
-        return ('No due date', None, False)
-    due_dt = datetime.fromtimestamp(int(due_ms) / 1000, tz=timezone.utc)
-    days_left = (due_dt - datetime.now(timezone.utc)).days
-    return (due_dt.strftime('%d %b %Y'), days_left, days_left < 0)
+def _relative_time(ms: int) -> str:
+    """e.g. 'Today', '1 day ago', '5 days ago' — used for Last Activity instead
+    of a raw date, per the team's reference sheet."""
+    if not ms:
+        return 'Unknown'
+    then = datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
+    days = (datetime.now(timezone.utc) - then).days
+    if days <= 0:
+        return 'Today'
+    if days == 1:
+        return '1 day ago'
+    return f'{days} days ago'
+
+
+def _days_since(ms: int) -> int:
+    if not ms:
+        return 0
+    then = datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
+    return max(0, (datetime.now(timezone.utc) - then).days)
 
 
 # ── Data collection ───────────────────────────────────────────────────────────
 
-def fetch_workspace_tasks(client: ClickUpClient, team_id: str, include_closed: bool) -> list:
-    """All tasks across every space/list in the workspace."""
+def fetch_workspace_tasks(client: ClickUpClient, team_id: str) -> list:
+    """
+    All ROOT tasks (no subtasks) across every space/list in the workspace,
+    open and closed both. Subtasks are deliberately excluded — this report
+    is scoped to main tasks only, and skipping them also cuts API call
+    volume a lot (subtask fetching is one call per parent task).
+    """
     all_tasks = []
     spaces = client.get_spaces(team_id)
     print(f'Found {len(spaces)} space(s)')
@@ -161,104 +181,109 @@ def fetch_workspace_tasks(client: ClickUpClient, team_id: str, include_closed: b
         lists = client.get_all_lists(space['id'])
         print(f'  Space: {space["name"]} — {len(lists)} list(s)')
         for lst in lists:
-            tasks = client.get_tasks(lst['id'], include_closed=include_closed)
+            tasks = client.get_tasks(lst['id'], include_closed=True, include_subtasks=False)
             print(f'    → {lst["name"]}: {len(tasks)} task(s)')
             all_tasks.extend(tasks)
     return all_tasks
 
 
 def fetch_support_tickets(client: ClickUpClient) -> list:
-    """Support list tickets, including closed ones (needed for resolved counts)."""
-    return client.get_tasks(CLICKUP_SUPPORT_LIST_ID, include_closed=True)
+    """Support list tickets, main tasks only, including closed ones (needed for resolved counts)."""
+    return client.get_tasks(CLICKUP_SUPPORT_LIST_ID, include_closed=True, include_subtasks=False)
 
 
-def fetch_time_by_task(client: ClickUpClient, team_id: str) -> dict:
-    """task_id -> total ms tracked last week, across every workspace member."""
+def fetch_time_by_person_task(client: ClickUpClient, team_id: str) -> Dict[str, Dict[str, int]]:
+    """person username -> {task_id: total_ms} for this reporting week."""
     start_ms, end_ms = _last_week_range_ms()
     members = client.get_workspace_members(team_id)
-    print(f'Fetching last-week time entries for {len(members)} member(s)...')
-    task_ms = defaultdict(int)
+    print(f'Fetching time entries for {len(members)} member(s), this reporting week...')
+    person_task_ms: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for m in members:
         uid = m.get('id')
-        if not uid:
+        username = m.get('username')
+        if not uid or not username:
             continue
-        entries = client.get_time_entries(team_id, start_ms, end_ms, assignee_id=uid)
+        try:
+            entries = client.get_time_entries(team_id, start_ms, end_ms, assignee_id=uid)
+        except Exception as exc:
+            print(f'  [warn] Could not fetch time entries for {username}: {exc}')
+            continue
         for e in entries:
             task = e.get('task') or {}
             tid = task.get('id')
             duration = int(e.get('duration', 0))
             if tid and duration > 0:
-                task_ms[tid] += duration
+                person_task_ms[username][tid] += duration
+    return person_task_ms
+
+
+def _flatten_task_ms(person_task_ms: Dict[str, Dict[str, int]]) -> Dict[str, int]:
+    """Sum across all people -> task_id -> total ms (used by the support-ticket rollup)."""
+    task_ms: Dict[str, int] = defaultdict(int)
+    for person, tasks in person_task_ms.items():
+        for tid, ms in tasks.items():
+            task_ms[tid] += ms
     return task_ms
 
 
-# ── Section builders (return plain data, not HTML — kept separate for testability) ──
+# ── Section builders ────────────────────────────────────────────────────────
 
-def build_client_implementation(all_tasks: list, task_ms: dict) -> dict:
+def build_onboarding(all_tasks: list) -> dict:
     by_client = defaultdict(list)
     for t in all_tasks:
-        # Only tasks in an "Active Onboardings" list count as client
-        # implementation work — everything else (support, internal, etc.)
-        # is out of scope for this section even if it happens to carry a
-        # Client custom field.
         if 'onboarding' not in _project_name(t).lower():
             continue
         client_name = _client_name_from_task(t)
         if not client_name or 'niro' in client_name.lower():
-            continue  # only external client-tagged implementation work
+            continue
         by_client[client_name].append(t)
 
     result = {}
     for client_name, tasks in by_client.items():
-        closed = [t for t in tasks if t.get('status', {}).get('type') == 'closed']
-        started = [t for t in tasks if t.get('status', {}).get('type') not in ('open', None)]
-        if len(closed) == len(tasks):
-            status = 'Completed'
-        elif not started:
-            status = 'Not Started'
-        else:
-            status = 'In Progress'
+        # Status = status of whichever task was updated most recently, so we
+        # show a real ClickUp status name rather than a synthetic label.
+        most_recent = max(tasks, key=lambda t: int(t.get('date_updated', 0) or 0))
+        status = (most_recent.get('status', {}).get('status') or 'Unknown').title()
 
-        total_ms = sum(task_ms.get(t['id'], 0) for t in tasks)
+        # Duration = days since the earliest task in this client's onboarding work was created.
+        created_ms = [int(t.get('date_created', 0) or 0) for t in tasks if t.get('date_created')]
+        duration_days = _days_since(min(created_ms)) if created_ms else 0
+
         last_activity_ms = max((int(t.get('date_updated', 0) or 0) for t in tasks), default=0)
-
-        resources = []
-        for t in tasks:
-            for res in _assignees(t):
-                resources.append({
-                    'resource': res,
-                    'product_module': _product_module_name(t),
-                    'tracked_ms': task_ms.get(t['id'], 0),
-                    'task_name': t.get('name', 'Untitled'),
-                })
 
         result[client_name] = {
             'status': status,
-            'duration_ms': total_ms,
+            'duration_days': duration_days,
             'last_activity_ms': last_activity_ms,
             'task_count': len(tasks),
-            'resources': resources,
         }
     return result
 
 
-def build_resource_project_tracking(open_tasks: list) -> dict:
-    by_resource = defaultdict(list)
-    for t in open_tasks:
-        due_str, days_left, overdue = _fmt_due(t.get('due_date'))
-        for res in _assignees(t):
-            by_resource[res].append({
-                'task_name': t.get('name', 'Untitled'),
-                'due_str': due_str,
-                'days_left': days_left,
-                'overdue': overdue,
-                'product_module': _product_module_name(t),
-                'task_url': t.get('url', '#'),
+def build_resource_tracking(all_tasks: list, person_task_ms: Dict[str, Dict[str, int]]) -> dict:
+    """resource -> {'total_ms': int, 'rows': [{'product_module', 'tracked_ms', 'task_name'}, ...]}"""
+    task_by_id = {t['id']: t for t in all_tasks}
+    result = {}
+    for person, task_times in person_task_ms.items():
+        rows = []
+        total_ms = 0
+        for tid, ms in task_times.items():
+            task = task_by_id.get(tid)
+            module = _product_module_name(task) if task else 'Unknown'
+            rows.append({
+                'product_module': module,
+                'tracked_ms': ms,
+                'task_name': task.get('name', 'Untitled') if task else 'Untitled',
             })
-    return by_resource
+            total_ms += ms
+        if not rows:
+            continue
+        rows.sort(key=lambda r: -r['tracked_ms'])
+        result[person] = {'total_ms': total_ms, 'rows': rows}
+    return result
 
 
-def build_customer_support(tickets: list, task_ms: dict) -> dict:
+def build_customer_support(tickets: list, task_ms: Dict[str, int]) -> dict:
     by_client = defaultdict(lambda: {'total': 0, 'resolved': 0, 'pending': 0,
                                       'tracked_ms': 0, 'resources': set(), 'statuses': set()})
     for t in tickets:
@@ -276,24 +301,6 @@ def build_customer_support(tickets: list, task_ms: dict) -> dict:
     return by_client
 
 
-def build_overdue(all_open_tasks: list) -> list:
-    overdue = []
-    for t in all_open_tasks:
-        due_str, days_left, is_overdue = _fmt_due(t.get('due_date'))
-        if not is_overdue:
-            continue
-        overdue.append({
-            'task_name': t.get('name', 'Untitled'),
-            'assignees': ', '.join(_assignees(t)),
-            'product_module': _product_module_name(t),
-            'due_str': due_str,
-            'days_overdue': abs(days_left),
-            'task_url': t.get('url', '#'),
-        })
-    overdue.sort(key=lambda x: -x['days_overdue'])
-    return overdue
-
-
 # ── HTML builder ──────────────────────────────────────────────────────────────
 
 def _slab(label: str, color: str) -> str:
@@ -307,65 +314,55 @@ def _section_title(label: str) -> str:
             f'letter-spacing:1.5px;margin-bottom:14px;">&#9632; {label}</div>')
 
 
-def build_email_html(client_impl: dict, resource_tracking: dict, support: dict, overdue: list, report_date: date) -> str:
+def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, report_date: date) -> str:
     today_str = report_date.strftime('%A, %B %d %Y')
     week_label = _last_week_display()
 
-    # ── Section 1: Client Implementation ──
-    impl_html = ''
-    for client_name, data in sorted(client_impl.items()):
-        status_colors = {'Completed': ('#166534', '#f0fdf4'), 'In Progress': ('#1d4ed8', '#eff6ff'),
-                          'Not Started': ('#92400e', '#fef3c7')}
-        fg, bg = status_colors.get(data['status'], ('#475569', '#f1f5f9'))
-        last_activity = (datetime.fromtimestamp(data['last_activity_ms'] / 1000, tz=timezone.utc)
-                          .strftime('%d %b %Y') if data['last_activity_ms'] else 'Unknown')
-        rows = ''.join(
-            f'<tr><td style="padding:6px 10px;font-size:12px;color:#334155;">{r["resource"]}</td>'
-            f'<td style="padding:6px 10px;font-size:12px;color:#334155;">{r["product_module"]}</td>'
-            f'<td style="padding:6px 10px;font-size:12px;color:#334155;">{_fmt_duration(r["tracked_ms"])}</td></tr>'
-            for r in data['resources']
+    # ── Section 1: Onboarding ──
+    onboarding_rows = ''
+    for client_name, d in sorted(onboarding.items()):
+        onboarding_rows += (
+            f'<tr><td style="padding:10px 12px;font-size:13px;color:#0f172a;font-weight:600;">{client_name}</td>'
+            f'<td style="padding:10px 12px;font-size:12px;">'
+            f'<span style="display:inline-block;padding:3px 10px;border-radius:10px;'
+            f'background:#eff6ff;color:#1d4ed8;font-size:11px;font-weight:700;">{d["status"]}</span></td>'
+            f'<td style="padding:10px 12px;font-size:13px;color:#334155;">{d["duration_days"]} '
+            f'day{"s" if d["duration_days"] != 1 else ""}</td>'
+            f'<td style="padding:10px 12px;font-size:13px;color:#64748b;">{_relative_time(d["last_activity_ms"])}</td></tr>'
         )
-        impl_html += f'''
-    <div style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:16px 18px;margin-bottom:12px;">
-      <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
-        <span style="font-size:15px;font-weight:700;color:#0f172a;">{client_name}</span>
-        <span style="display:inline-block;padding:3px 10px;border-radius:10px;background:{bg};color:{fg};font-size:11px;font-weight:700;">{data['status']}</span>
-      </div>
-      <div style="font-size:12px;color:#64748b;margin-bottom:10px;">
-        {data['task_count']} task(s) &middot; {_fmt_duration(data['duration_ms'])} tracked ({week_label}) &middot; last activity {last_activity}
-      </div>
-      <table width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #f1f5f9;">
-        <tr><th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Resource</th>
-            <th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Product Module</th>
-            <th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Tracked</th></tr>
-        {rows}
-      </table>
-    </div>'''
-    if not impl_html:
-        impl_html = '<div style="color:#94a3b8;font-size:13px;">No client-tagged implementation work found.</div>'
+    if not onboarding_rows:
+        onboarding_rows = ('<tr><td colspan="4" style="padding:12px;color:#94a3b8;font-size:13px;">'
+                            'No active onboarding clients found.</td></tr>')
 
     # ── Section 2: Resource → Product Module Tracking ──
     tracking_html = ''
-    for resource, tasks in sorted(resource_tracking.items()):
-        rows = ''
-        for t in sorted(tasks, key=lambda x: (x['days_left'] is None, x['days_left'] or 0)):
-            due_color = '#b91c1c' if t['overdue'] else '#334155'
-            rows += (f'<tr><td style="padding:6px 10px;font-size:12px;color:#0f172a;">'
-                     f'<a href="{t["task_url"]}" style="color:#0f172a;text-decoration:none;">{t["task_name"]}</a></td>'
-                     f'<td style="padding:6px 10px;font-size:12px;color:{due_color};">{t["due_str"]}</td>'
-                     f'<td style="padding:6px 10px;font-size:12px;color:#64748b;">{t["product_module"]}</td></tr>')
+    for resource, data in sorted(resource_tracking.items(), key=lambda kv: -kv[1]['total_ms']):
+        rows = ''.join(
+            f'<tr><td style="padding:6px 10px;font-size:12px;color:#0f172a;">{r["product_module"]}</td>'
+            f'<td style="padding:6px 10px;font-size:12px;color:#64748b;">{_fmt_duration(r["tracked_ms"])}</td></tr>'
+            for r in data['rows']
+        )
         tracking_html += f'''
     <div style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:16px 18px;margin-bottom:12px;">
-      <div style="font-size:14px;font-weight:700;color:#0f172a;margin-bottom:8px;">{resource} &middot; {len(tasks)} task(s)</div>
+      <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:8px;">
+        <tr>
+          <td style="font-size:14px;font-weight:700;color:#0f172a;">{resource}</td>
+          <td align="right">
+            <span style="display:inline-block;padding:5px 12px;border-radius:12px;background:#ECFDF5;
+                         color:#059669;font-size:13px;font-weight:700;white-space:nowrap;">
+              &#9203; {_fmt_duration(data['total_ms'])} total
+            </span>
+          </td>
+        </tr>
+      </table>
       <table width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #f1f5f9;">
-        <tr><th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Task</th>
-            <th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Due Date</th>
-            <th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Product Module</th></tr>
+        <tr><th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Product Module</th>
+            <th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Tracked Time</th></tr>
         {rows}
       </table>
     </div>'''
     if not tracking_html:
-        tracking_html = '<div style="color:#94a3b8;font-size:13px;">No open tasks found.</div>'
+        tracking_html = '<div style="color:#94a3b8;font-size:13px;">No time tracked this week.</div>'
 
     # ── Section 3: Customer Support ──
     support_rows = ''
@@ -379,20 +376,8 @@ def build_email_html(client_impl: dict, resource_tracking: dict, support: dict, 
             f'<td style="padding:8px 12px;font-size:12px;color:#64748b;">{", ".join(sorted(d["resources"]))}</td></tr>'
         )
     if not support_rows:
-        support_rows = '<tr><td colspan="6" style="padding:12px;color:#94a3b8;font-size:13px;">No support tickets found.</td></tr>'
-
-    # ── Section 4: Overdue ──
-    overdue_rows = ''
-    for t in overdue:
-        overdue_rows += (
-            f'<tr><td style="padding:8px 12px;font-size:12px;color:#0f172a;">'
-            f'<a href="{t["task_url"]}" style="color:#0f172a;text-decoration:none;">{t["task_name"]}</a></td>'
-            f'<td style="padding:8px 12px;font-size:12px;color:#64748b;">{t["assignees"]}</td>'
-            f'<td style="padding:8px 12px;font-size:12px;color:#64748b;">{t["product_module"]}</td>'
-            f'<td style="padding:8px 12px;font-size:12px;color:#b91c1c;font-weight:700;">{t["days_overdue"]}d overdue</td></tr>'
-        )
-    if not overdue_rows:
-        overdue_rows = '<tr><td colspan="4" style="padding:12px;color:#166534;font-size:13px;">Nothing overdue — clean slate.</td></tr>'
+        support_rows = ('<tr><td colspan="6" style="padding:12px;color:#94a3b8;font-size:13px;">'
+                         'No support tickets found.</td></tr>')
 
     return f'''<!DOCTYPE html>
 <html lang="en">
@@ -407,14 +392,25 @@ def build_email_html(client_impl: dict, resource_tracking: dict, support: dict, 
   </td></tr>
   <tr><td style="height:4px;background:linear-gradient(90deg,#6366F1,#A855F7,#EC4899);"></td></tr>
 
-  {_slab('&#128188; Client Implementation', '#7c3aed')}
-  <tr><td style="background:#fff;padding:20px 32px;">{_section_title('Client Implementation — Status &amp; Last Activity')}{impl_html}</td></tr>
+  {_slab('&#128188; Onboarding', '#7c3aed')}
+  <tr><td style="background:#fff;padding:20px 32px;">
+    {_section_title('Active Onboarding Clients')}
+    <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;">
+      <tr style="background:#f5f3ff;">
+        <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Client Name</th>
+        <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Status</th>
+        <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Duration</th>
+        <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Last Activity</th>
+      </tr>
+      {onboarding_rows}
+    </table>
+  </td></tr>
 
   {_slab('&#128100; Resource → Product Module Tracking', '#1a56a0')}
-  <tr><td style="background:#fff;padding:20px 32px;">{_section_title('Open Tasks by Resource')}{tracking_html}</td></tr>
+  <tr><td style="background:#fff;padding:20px 32px;">{_section_title(f'This Week — {week_label}')}{tracking_html}</td></tr>
 
   {_slab('&#127919; Customer Support', '#166534')}
-  <tr><td style="background:#fff;padding:20px 32px;">
+  <tr><td style="background:#fff;padding:20px 32px 32px;border-radius:0 0 20px 20px;">
     {_section_title('Tickets by Client')}
     <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;">
       <tr style="background:#f0fdf4;">
@@ -426,20 +422,6 @@ def build_email_html(client_impl: dict, resource_tracking: dict, support: dict, 
         <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Resource(s)</th>
       </tr>
       {support_rows}
-    </table>
-  </td></tr>
-
-  {_slab('&#9888; Overdue Tasks', '#b91c1c')}
-  <tr><td style="background:#fff;padding:20px 32px 32px;border-radius:0 0 20px 20px;">
-    {_section_title(f'All Overdue Tasks ({len(overdue)})')}
-    <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #fecaca;border-radius:8px;overflow:hidden;">
-      <tr style="background:#fef2f2;">
-        <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Task</th>
-        <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Assignee</th>
-        <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Product Module</th>
-        <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Overdue by</th>
-      </tr>
-      {overdue_rows}
     </table>
   </td></tr>
 
@@ -481,35 +463,28 @@ def main() -> None:
 
     print('=== Weekly ClickUp Ops Report ===\n')
 
-    print('Fetching ALL tasks (open + closed) workspace-wide — single pass, used for every section...')
-    all_tasks = fetch_workspace_tasks(client, team_id, include_closed=True)
-    print(f'Total tasks (all): {len(all_tasks)}\n')
+    print('Fetching ALL root tasks (open + closed, no subtasks) workspace-wide...')
+    all_tasks = fetch_workspace_tasks(client, team_id)
+    print(f'Total root tasks: {len(all_tasks)}\n')
 
-    # Derive the open subset locally instead of re-scanning the whole workspace
-    # a second time — that doubled every API call and made rate-limit-driven
-    # silent data loss far more likely.
-    open_tasks = [t for t in all_tasks if t.get('status', {}).get('type') != 'closed']
-    print(f'Open tasks (derived from the single pass above): {len(open_tasks)}\n')
-
-    print('Fetching support tickets (open + closed)...')
+    print('Fetching support tickets (open + closed, no subtasks)...')
     support_tickets = fetch_support_tickets(client)
     print(f'Total support tickets: {len(support_tickets)}\n')
 
-    task_ms = fetch_time_by_task(client, team_id)
-    print(f'Time entries found for {len(task_ms)} distinct task(s)\n')
+    person_task_ms = fetch_time_by_person_task(client, team_id)
+    task_ms = _flatten_task_ms(person_task_ms)
+    print(f'Time entries found for {len(task_ms)} distinct task(s) across {len(person_task_ms)} people\n')
 
-    client_impl = build_client_implementation(all_tasks, task_ms)
-    resource_tracking = build_resource_project_tracking(open_tasks)
+    onboarding = build_onboarding(all_tasks)
+    resource_tracking = build_resource_tracking(all_tasks, person_task_ms)
     support = build_customer_support(support_tickets, task_ms)
-    overdue = build_overdue(open_tasks)
 
-    print(f'Summary: {len(client_impl)} client(s) in implementation, '
-          f'{len(resource_tracking)} resource(s) tracked, '
-          f'{len(support)} client(s) in support, '
-          f'{len(overdue)} overdue task(s)')
+    print(f'Summary: {len(onboarding)} client(s) onboarding, '
+          f'{len(resource_tracking)} resource(s) with tracked time, '
+          f'{len(support)} client(s) in support')
 
     report_date = date.today()
-    html = build_email_html(client_impl, resource_tracking, support, overdue, report_date)
+    html = build_email_html(onboarding, resource_tracking, support, report_date)
     subject = f'Weekly Ops Report — {_last_week_display()}'
 
     send_email(html, subject, {
