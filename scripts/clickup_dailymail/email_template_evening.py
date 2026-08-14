@@ -182,12 +182,24 @@ def _section_header(label: str, count: int, color: str) -> str:
     </tr>"""
 
 
+def _fmt_hours_from_ms(ms: int) -> str:
+    hours = ms / 3600000.0
+    if hours <= 0:
+        return "0h"
+    if hours < 1:
+        return f"{round(hours * 60)}m"
+    if hours == int(hours):
+        return f"{int(hours)}h"
+    return f"{hours:.1f}h"
+
+
 def _person_section_html(name: str, data: dict) -> str:
     avatar = _avatar_html(name, data.get("avatar"))
     planned = data.get("planned", [])
     unplanned = data.get("unplanned", [])
     total = len(planned) + len(unplanned)
     task_word = "task" if total == 1 else "tasks"
+    total_logged_ms = data.get("total_logged_ms", 0)
 
     planned_rows = ""
     if planned:
@@ -205,9 +217,9 @@ def _person_section_html(name: str, data: dict) -> str:
                   border-radius:16px;overflow:hidden;">
       <tr>
         <td style="padding:18px 22px 14px 22px;border-bottom:1px solid #F1F5F9;">
-          <table cellpadding="0" cellspacing="0" border="0">
+          <table cellpadding="0" cellspacing="0" border="0" width="100%">
             <tr>
-              <td style="vertical-align:middle;padding-right:14px;">{avatar}</td>
+              <td style="vertical-align:middle;padding-right:14px;width:44px;">{avatar}</td>
               <td style="vertical-align:middle;">
                 <p style="margin:0;font-family:Arial,sans-serif;font-size:16px;
                            font-weight:700;color:#1E293B;">{name}</p>
@@ -217,6 +229,13 @@ def _person_section_html(name: str, data: dict) -> str:
                   &nbsp;·&nbsp;
                   <span style="color:#EA580C;">{len(unplanned)} unplanned</span>
                 </p>
+              </td>
+              <td style="vertical-align:middle;text-align:right;white-space:nowrap;">
+                <span style="display:inline-block;padding:5px 12px;border-radius:12px;
+                             background:#ECFDF5;color:#059669;font-size:13px;font-weight:700;
+                             font-family:Arial,sans-serif;white-space:nowrap;">
+                  &#9203; {_fmt_hours_from_ms(total_logged_ms)} logged
+                </span>
               </td>
             </tr>
           </table>
@@ -239,6 +258,7 @@ def generate_email_html(report: Dict[str, dict], report_date: date) -> str:
     total_people = len(report)
     total_planned = sum(len(d["planned"]) for d in report.values())
     total_unplanned = sum(len(d["unplanned"]) for d in report.values())
+    total_logged_ms = sum(d.get("total_logged_ms", 0) for d in report.values())
 
     person_sections = "".join(
         _person_section_html(name, data)
@@ -302,6 +322,12 @@ def generate_email_html(report: Dict[str, dict], report_date: date) -> str:
                     <p style="margin:0;font-family:Arial,sans-serif;font-size:26px;font-weight:800;color:#EA580C;">{total_unplanned}</p>
                     <p style="margin:2px 0 0;font-family:Arial,sans-serif;font-size:11px;font-weight:600;
                                letter-spacing:1px;color:#94A3B8;text-transform:uppercase;">Unplanned</p>
+                  </td>
+                  <td style="width:1px;background:#E2E8F0;">&nbsp;</td>
+                  <td style="padding-left:28px;">
+                    <p style="margin:0;font-family:Arial,sans-serif;font-size:26px;font-weight:800;color:#059669;">{_fmt_hours_from_ms(total_logged_ms)}</p>
+                    <p style="margin:2px 0 0;font-family:Arial,sans-serif;font-size:11px;font-weight:600;
+                               letter-spacing:1px;color:#94A3B8;text-transform:uppercase;">Logged</p>
                   </td>
                 </tr>
               </table>
