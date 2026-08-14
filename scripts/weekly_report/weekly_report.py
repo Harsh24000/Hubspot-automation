@@ -260,16 +260,52 @@ def build_onboarding(all_tasks: list) -> dict:
     return result
 
 
-def build_resource_tracking(all_tasks: list, person_task_ms: Dict[str, Dict[str, int]]) -> dict:
+def build_resource_tracking(client: ClickUpClient, all_tasks: list, person_task_ms: Dict[str, Dict[str, int]]) -> dict:
     """resource -> {'total_ms': int, 'rows': [{'product_module', 'tracked_ms', 'task_name'}, ...]}"""
     task_by_id = {t['id']: t for t in all_tasks}
+    # Cache for tasks we have to look up individually — happens when someone
+    # logged time against a SUBTASK, since the workspace scan deliberately
+    # only fetches root tasks. Without this, every such entry would show
+    # "Unknown" for its Product Module even though the data genuinely exists,
+    # just one API call away.
+    lookup_cache: Dict[str, dict] = {}
+
+    def _resolve_task(tid: str):
+        if tid in task_by_id:
+            return task_by_id[tid]
+        if tid in lookup_cache:
+            return lookup_cache[tid]
+        try:
+            fetched = client._get(f'task/{tid}')
+            lookup_cache[tid] = fetched
+            return fetched
+        except Exception as exc:
+            print(f'  [warn] Could not look up task {tid} (likely a subtask): {exc}')
+            lookup_cache[tid] = None
+            return None
+
+    def _resolve_module(task: dict) -> str:
+        module = _product_module_name(task)
+        if module not in ('N/A', ''):
+            return module
+        # Subtasks often don't repeat the parent's custom field values —
+        # if this task has no module of its own, check its parent once.
+        parent_id = task.get('parent')
+        if parent_id:
+            parent_task = _resolve_task(parent_id)
+            if parent_task:
+                parent_module = _product_module_name(parent_task)
+                if parent_module not in ('N/A', ''):
+                    return parent_module
+        return module  # still 'N/A' — genuinely not set anywhere
+
     result = {}
     for person, task_times in person_task_ms.items():
         rows = []
         total_ms = 0
         for tid, ms in task_times.items():
-            task = task_by_id.get(tid)
-            module = _product_module_name(task) if task else 'Unknown'
+            task = _resolve_task(tid)
+            module = _resolve_module(task) if task else 'Unknown'
             rows.append({
                 'product_module': module,
                 'tracked_ms': ms,
@@ -476,7 +512,7 @@ def main() -> None:
     print(f'Time entries found for {len(task_ms)} distinct task(s) across {len(person_task_ms)} people\n')
 
     onboarding = build_onboarding(all_tasks)
-    resource_tracking = build_resource_tracking(all_tasks, person_task_ms)
+    resource_tracking = build_resource_tracking(client, all_tasks, person_task_ms)
     support = build_customer_support(support_tickets, task_ms)
 
     print(f'Summary: {len(onboarding)} client(s) onboarding, '
