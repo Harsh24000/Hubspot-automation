@@ -16,7 +16,7 @@ Output mirrors the team's reference spreadsheet exactly:
   - "TS"        = Time Spent, in decimal hours (78, 9.5, 6.75, 46.6 ...),
                   exactly how the reference sheet writes it. Zero renders as "-".
 
-Plus a team-wide donut of time spent per activity, and per-resource totals.
+Plus a team-wide donut of time spent per project, and per-resource totals.
 
 ASSUMPTIONS
 - "Product Module" = a custom field whose name contains "module" or "product".
@@ -227,7 +227,7 @@ def fetch_workspace_tasks(client: ClickUpClient, team_id: str) -> list:
 
 
 def build_module_resolver(client: ClickUpClient, all_tasks: list):
-    """task_id -> activity name, with a parent fallback for subtasks."""
+    """task_id -> project name, with a parent fallback for subtasks."""
     task_by_id = {t['id']: t for t in all_tasks}
     lookup_cache: Dict[str, dict] = {}
 
@@ -340,7 +340,7 @@ def donut_svg(segments: List[Tuple[str, float, str]], total: float,
 
     return (
         f'<svg width="{size}" height="{size}" viewBox="0 0 {size} {size}" '
-        f'xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Time spent by activity">'
+        f'xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Time spent by project">'
         f'<circle cx="{cx}" cy="{cy}" r="{radius:.2f}" fill="none" stroke="#eef1f5" '
         f'stroke-width="{thickness}"></circle>'
         + ''.join(arcs) +
@@ -598,7 +598,7 @@ def main() -> None:
     resolve_module = build_module_resolver(client, all_tasks)
     matrix = build_matrix(person_task_ms, resolve_module)
 
-    print(f'\nSummary: {len(matrix["activities"])} activity/activities, '
+    print(f'\nSummary: {len(matrix["projects"])} project(s), '
           f'{len(matrix["resources"])} resource(s), '
           f'{fmt_hours(matrix["grand_hours"])}h total')
 
