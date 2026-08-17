@@ -3,36 +3,44 @@
 Weekly ClickUp Ops Report
 Runs every Monday morning (triggered externally via cron-job.org → GitHub Actions).
 
-Three sections, matching the team's own reference spreadsheet layout:
+STRICT WEEK SCOPING
+-------------------
+Every number in this report describes LAST WEEK ONLY — Monday 00:00:00 IST
+through Sunday 23:59:59 IST of the week before the run. A task/ticket is
+counted as "last week's" if ANY of these fall inside that window:
 
-1. Onboarding — tasks in an "Active Onboardings" list, tagged with a "Client"
-   custom field, grouped by client. Shows Client Name, Status (the current
-   status of that client's most recently updated task), Duration (days since
-   their earliest onboarding task was created), and Last Activity (relative,
-   e.g. "3 days ago"). No time-tracking figures in this section.
-2. Resource → Product Module Tracking — for each resource (assignee), every
-   product module they logged time against this week, with hours tracked,
-   plus a total-tracked-time badge at the top of their card.
-3. Customer Support — tickets from the Customer Support list (same list the
-   daily report reads), grouped by client: total / resolved / pending counts,
+    - it was created            (date_created)
+    - it was updated            (date_updated)
+    - it was closed             (date_closed)
+    - someone logged time on it (ClickUp time entries, already week-bounded)
+
+Anything outside that window is excluded, even if it is still open. This is the
+difference from the previous version, which reported the LIFETIME contents of
+the support and onboarding lists and therefore showed totals like "13 tickets"
+for a client that had nothing at all last week.
+
+Three sections:
+
+1. Onboarding — clients with onboarding-list activity last week. Tasks whose
+   status is CLOSED are excluded, and a client whose tasks are all closed drops
+   off the report entirely. Shows Client, Status, Duration, Last Activity.
+2. Resource → Project Tracking — per resource, time logged last week, grouped
+   by project. One row per project with the summed time (NOT one row per task).
+3. Customer Support — tickets from the Customer Support list that saw activity
+   last week, grouped by client: ticket type, total / resolved / pending,
    tracked time, and assigned resource(s).
 
 Only ROOT tasks are scanned — subtasks are deliberately excluded (this also
 cuts API call volume substantially, which reduces rate-limit risk).
 
-ASSUMPTIONS:
-- "Resource" = the task's assignee.
-- "Product Module" = a custom field whose name contains "module" or "product".
-- "Client" = a custom field whose name contains "client" or "company".
-- "Active Onboardings" scope = any list whose name contains "onboarding"
-  (case-insensitive) — the Onboarding section only counts tasks living there.
-- "Tracked time" = time logged via ClickUp time tracking, for this reporting
-  week (Monday 00:00 IST through Sunday 23:59 IST, the week before this run).
-- Onboarding "Status" = the ClickUp status of whichever of that client's
-  onboarding tasks was updated most recently (so it shows real status names
-  like "UAT", not a synthetic label).
-- "Duration" = whole days between the client's earliest onboarding task being
-  created and today.
+ASSUMPTIONS
+- "Resource"     = the person who logged the time.
+- "Project"      = a custom field whose name contains "module" or "product".
+- "Client"       = a custom field whose name contains "client" or "company".
+- "Ticket Type"  = a custom field whose name contains "ticket type" (falling
+                   back to any field containing "type"). The field actually
+                   matched is printed at startup so it can be verified.
+- "Active Onboardings" scope = any list whose name contains "onboarding".
 """
 
 import os
@@ -42,12 +50,15 @@ from collections import defaultdict
 from datetime import date, datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Dict, List
+from typing import Dict, List, Set
 
 from clickup_client import ClickUpClient
 
 CLICKUP_SUPPORT_LIST_ID = os.environ.get('CLICKUP_SUPPORT_LIST_ID', '901615411023')
 IST = timezone(timedelta(hours=5, minutes=30))
+
+# Remembers which custom field supplied Ticket Type, so the run log can say so.
+_TICKET_TYPE_FIELDS_SEEN: Set[str] = set()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -77,8 +88,33 @@ def _client_name_from_task(task: dict) -> str:
     return ''
 
 
+def _ticket_type_from_task(task: dict) -> str:
+    """Ticket Type custom field.
+
+    Prefers a field literally named like "Ticket Type"; falls back to any
+    custom field with "type" in its name so a slightly different label in
+    ClickUp still works. Records which field won, for the startup log.
+    """
+    fallback = ''
+    for field in task.get('custom_fields', []):
+        field_name = (field.get('name') or '').strip()
+        name_lower = field_name.lower()
+        if 'type' not in name_lower:
+            continue
+        value = _extract_custom_field_value(field)
+        if not value:
+            continue
+        if 'ticket type' in name_lower or name_lower == 'type':
+            _TICKET_TYPE_FIELDS_SEEN.add(field_name)
+            return value.strip()
+        if not fallback:
+            fallback = value.strip()
+            _TICKET_TYPE_FIELDS_SEEN.add(field_name)
+    return fallback
+
+
 def _product_module_name(task: dict) -> str:
-    """Extract 'Product Module' from a custom field (drop_down, text, or labels type)."""
+    """Extract the project ('Product Module' custom field in ClickUp)."""
     for field in task.get('custom_fields', []):
         name_lower = (field.get('name') or '').lower()
         if 'module' not in name_lower and 'product' not in name_lower:
@@ -113,6 +149,10 @@ def _assignees(task: dict) -> list:
     return [n for n in names if n] or ['Unassigned']
 
 
+def _is_closed(task: dict) -> bool:
+    return (task.get('status') or {}).get('type') == 'closed'
+
+
 def _last_week_range_ms() -> tuple:
     """Monday 00:00 IST through Sunday 23:59:59 IST of the week before this run."""
     now_ist = datetime.now(IST)
@@ -132,6 +172,32 @@ def _last_week_display() -> str:
     return f"Monday {start.strftime('%d %b')} – Sunday {end.strftime('%d %b %Y')}"
 
 
+def _in_week(timestamp_ms, start_ms: int, end_ms: int) -> bool:
+    try:
+        ts = int(timestamp_ms or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(ts) and start_ms <= ts <= end_ms
+
+
+def _touched_last_week(task: dict, start_ms: int, end_ms: int,
+                       task_ms: Dict[str, int]) -> bool:
+    """Created, updated, closed, or time-tracked inside the reporting week.
+
+    This is THE filter that keeps the report honest — without it the support
+    and onboarding sections report the whole lifetime of their lists.
+    """
+    if _in_week(task.get('date_created'), start_ms, end_ms):
+        return True
+    if _in_week(task.get('date_updated'), start_ms, end_ms):
+        return True
+    if _in_week(task.get('date_closed'), start_ms, end_ms):
+        return True
+    # Time entries were already fetched with the same window, so any hours here
+    # are by definition last week's.
+    return task_ms.get(task.get('id'), 0) > 0
+
+
 def _fmt_duration(ms: int) -> str:
     if not ms:
         return '0h'
@@ -145,12 +211,12 @@ def _fmt_duration(ms: int) -> str:
 
 
 def _relative_time(ms: int) -> str:
-    """e.g. 'Today', '1 day ago', '5 days ago' — used for Last Activity instead
-    of a raw date, per the team's reference sheet."""
+    """e.g. 'Today', '1 day ago', '5 days ago'. Computed in IST, matching the
+    reporting window (this used to be done in UTC and could be a day out)."""
     if not ms:
         return 'Unknown'
-    then = datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
-    days = (datetime.now(timezone.utc) - then).days
+    then = datetime.fromtimestamp(int(ms) / 1000, tz=IST)
+    days = (datetime.now(IST).date() - then.date()).days
     if days <= 0:
         return 'Today'
     if days == 1:
@@ -161,19 +227,14 @@ def _relative_time(ms: int) -> str:
 def _days_since(ms: int) -> int:
     if not ms:
         return 0
-    then = datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
-    return max(0, (datetime.now(timezone.utc) - then).days)
+    then = datetime.fromtimestamp(int(ms) / 1000, tz=IST)
+    return max(0, (datetime.now(IST).date() - then.date()).days)
 
 
 # ── Data collection ───────────────────────────────────────────────────────────
 
 def fetch_workspace_tasks(client: ClickUpClient, team_id: str) -> list:
-    """
-    All ROOT tasks (no subtasks) across every space/list in the workspace,
-    open and closed both. Subtasks are deliberately excluded — this report
-    is scoped to main tasks only, and skipping them also cuts API call
-    volume a lot (subtask fetching is one call per parent task).
-    """
+    """All ROOT tasks (no subtasks) across every space/list, open and closed."""
     all_tasks = []
     spaces = client.get_spaces(team_id)
     print(f'Found {len(spaces)} space(s)')
@@ -188,7 +249,8 @@ def fetch_workspace_tasks(client: ClickUpClient, team_id: str) -> list:
 
 
 def fetch_support_tickets(client: ClickUpClient) -> list:
-    """Support list tickets, main tasks only, including closed ones (needed for resolved counts)."""
+    """Support list tickets, main tasks only, including closed ones (needed to
+    count what was resolved during the week)."""
     return client.get_tasks(CLICKUP_SUPPORT_LIST_ID, include_closed=True, include_subtasks=False)
 
 
@@ -198,6 +260,7 @@ def fetch_time_by_person_task(client: ClickUpClient, team_id: str) -> Dict[str, 
     members = client.get_workspace_members(team_id)
     print(f'Fetching time entries for {len(members)} member(s), this reporting week...')
     person_task_ms: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    seen_entry_ids: Set[str] = set()
     for m in members:
         uid = m.get('id')
         username = m.get('username')
@@ -209,16 +272,26 @@ def fetch_time_by_person_task(client: ClickUpClient, team_id: str) -> Dict[str, 
             print(f'  [warn] Could not fetch time entries for {username}: {exc}')
             continue
         for e in entries:
+            # A member can be returned more than once by ClickUp; never let the
+            # same entry be counted twice.
+            entry_id = e.get('id')
+            if entry_id and entry_id in seen_entry_ids:
+                continue
+            if entry_id:
+                seen_entry_ids.add(entry_id)
             task = e.get('task') or {}
             tid = task.get('id')
-            duration = int(e.get('duration', 0))
+            try:
+                duration = int(e.get('duration', 0))
+            except (TypeError, ValueError):
+                duration = 0
             if tid and duration > 0:
                 person_task_ms[username][tid] += duration
-    return person_task_ms
+    return {person: tasks for person, tasks in person_task_ms.items() if tasks}
 
 
 def _flatten_task_ms(person_task_ms: Dict[str, Dict[str, int]]) -> Dict[str, int]:
-    """Sum across all people -> task_id -> total ms (used by the support-ticket rollup)."""
+    """Sum across all people -> task_id -> total ms."""
     task_ms: Dict[str, int] = defaultdict(int)
     for person, tasks in person_task_ms.items():
         for tid, ms in tasks.items():
@@ -228,46 +301,54 @@ def _flatten_task_ms(person_task_ms: Dict[str, Dict[str, int]]) -> Dict[str, int
 
 # ── Section builders ────────────────────────────────────────────────────────
 
-def build_onboarding(all_tasks: list) -> dict:
+def build_onboarding(all_tasks: list, task_ms: Dict[str, int]) -> dict:
+    """Onboarding clients with activity last week, closed tasks excluded."""
+    start_ms, end_ms = _last_week_range_ms()
     by_client = defaultdict(list)
+    skipped_closed = 0
+    skipped_stale = 0
+
     for t in all_tasks:
         if 'onboarding' not in _project_name(t).lower():
             continue
         client_name = _client_name_from_task(t)
         if not client_name or 'niro' in client_name.lower():
             continue
+        if _is_closed(t):
+            skipped_closed += 1
+            continue
+        if not _touched_last_week(t, start_ms, end_ms, task_ms):
+            skipped_stale += 1
+            continue
         by_client[client_name].append(t)
+
+    print(f'  Onboarding: {len(by_client)} client(s) active last week '
+          f'({skipped_closed} closed task(s) hidden, {skipped_stale} with no activity last week)')
 
     result = {}
     for client_name, tasks in by_client.items():
-        # Status = status of whichever task was updated most recently, so we
-        # show a real ClickUp status name rather than a synthetic label.
         most_recent = max(tasks, key=lambda t: int(t.get('date_updated', 0) or 0))
         status = (most_recent.get('status', {}).get('status') or 'Unknown').title()
-
-        # Duration = days since the earliest task in this client's onboarding work was created.
         created_ms = [int(t.get('date_created', 0) or 0) for t in tasks if t.get('date_created')]
         duration_days = _days_since(min(created_ms)) if created_ms else 0
-
         last_activity_ms = max((int(t.get('date_updated', 0) or 0) for t in tasks), default=0)
-
         result[client_name] = {
             'status': status,
             'duration_days': duration_days,
             'last_activity_ms': last_activity_ms,
-            'task_count': len(tasks),
         }
     return result
 
 
-def build_resource_tracking(client: ClickUpClient, all_tasks: list, person_task_ms: Dict[str, Dict[str, int]]) -> dict:
-    """resource -> {'total_ms': int, 'rows': [{'product_module', 'tracked_ms', 'task_name'}, ...]}"""
+def build_resource_tracking(client: ClickUpClient, all_tasks: list,
+                            person_task_ms: Dict[str, Dict[str, int]]) -> dict:
+    """resource -> {'total_ms': int, 'rows': [{'project', 'tracked_ms'}, ...]}
+
+    Rows are aggregated PER PROJECT, not per task — the previous version
+    emitted one row per task, so a person who logged nine separate sessions
+    against "Rituals" got nine identical-looking rows.
+    """
     task_by_id = {t['id']: t for t in all_tasks}
-    # Cache for tasks we have to look up individually — happens when someone
-    # logged time against a SUBTASK, since the workspace scan deliberately
-    # only fetches root tasks. Without this, every such entry would show
-    # "Unknown" for its Product Module even though the data genuinely exists,
-    # just one API call away.
     lookup_cache: Dict[str, dict] = {}
 
     def _resolve_task(tid: str):
@@ -288,8 +369,6 @@ def build_resource_tracking(client: ClickUpClient, all_tasks: list, person_task_
         module = _product_module_name(task)
         if module not in ('N/A', ''):
             return module
-        # Subtasks often don't repeat the parent's custom field values —
-        # if this task has no module of its own, check its parent once.
         parent_id = task.get('parent')
         if parent_id:
             parent_task = _resolve_task(parent_id)
@@ -297,43 +376,49 @@ def build_resource_tracking(client: ClickUpClient, all_tasks: list, person_task_
                 parent_module = _product_module_name(parent_task)
                 if parent_module not in ('N/A', ''):
                     return parent_module
-        return module  # still 'N/A' — genuinely not set anywhere
+        return module
 
     result = {}
     for person, task_times in person_task_ms.items():
-        rows = []
+        per_project: Dict[str, int] = defaultdict(int)
         total_ms = 0
         for tid, ms in task_times.items():
             task = _resolve_task(tid)
-            module = _resolve_module(task) if task else 'Unknown'
-            rows.append({
-                'product_module': module,
-                'tracked_ms': ms,
-                'task_name': task.get('name', 'Untitled') if task else 'Untitled',
-            })
+            project = _resolve_module(task) if task else 'Unknown'
+            per_project[project] += ms
             total_ms += ms
-        if not rows:
+        if not per_project:
             continue
+        rows = [{'project': name, 'tracked_ms': ms} for name, ms in per_project.items()]
         rows.sort(key=lambda r: -r['tracked_ms'])
         result[person] = {'total_ms': total_ms, 'rows': rows}
     return result
 
 
 def build_customer_support(tickets: list, task_ms: Dict[str, int]) -> dict:
+    """Support tickets that saw activity last week, grouped by client."""
+    start_ms, end_ms = _last_week_range_ms()
     by_client = defaultdict(lambda: {'total': 0, 'resolved': 0, 'pending': 0,
-                                      'tracked_ms': 0, 'resources': set(), 'statuses': set()})
+                                     'tracked_ms': 0, 'resources': set(), 'types': set()})
+    considered = 0
     for t in tickets:
+        if not _touched_last_week(t, start_ms, end_ms, task_ms):
+            continue
+        considered += 1
         client_name = _client_name_from_task(t) or 'Unspecified'
         entry = by_client[client_name]
         entry['total'] += 1
-        is_closed = t.get('status', {}).get('type') == 'closed'
-        if is_closed:
+        if _is_closed(t):
             entry['resolved'] += 1
         else:
             entry['pending'] += 1
         entry['tracked_ms'] += task_ms.get(t['id'], 0)
         entry['resources'].update(_assignees(t))
-        entry['statuses'].add(t.get('status', {}).get('status', 'unknown'))
+        ticket_type = _ticket_type_from_task(t)
+        if ticket_type:
+            entry['types'].add(ticket_type)
+
+    print(f'  Customer Support: {considered} of {len(tickets)} ticket(s) had activity last week')
     return by_client
 
 
@@ -368,14 +453,15 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
         )
     if not onboarding_rows:
         onboarding_rows = ('<tr><td colspan="4" style="padding:12px;color:#94a3b8;font-size:13px;">'
-                            'No active onboarding clients found.</td></tr>')
+                           'No onboarding activity last week.</td></tr>')
 
-    # ── Section 2: Resource → Product Module Tracking ──
+    # ── Section 2: Resource → Project Tracking ──
     tracking_html = ''
     for resource, data in sorted(resource_tracking.items(), key=lambda kv: -kv[1]['total_ms']):
         rows = ''.join(
-            f'<tr><td style="padding:6px 10px;font-size:12px;color:#0f172a;">{r["product_module"]}</td>'
-            f'<td style="padding:6px 10px;font-size:12px;color:#64748b;">{_fmt_duration(r["tracked_ms"])}</td></tr>'
+            f'<tr><td style="padding:6px 10px;font-size:12px;color:#0f172a;">{r["project"]}</td>'
+            f'<td style="padding:6px 10px;font-size:12px;color:#64748b;text-align:right;">'
+            f'{_fmt_duration(r["tracked_ms"])}</td></tr>'
             for r in data['rows']
         )
         tracking_html += f'''
@@ -392,19 +478,21 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
         </tr>
       </table>
       <table width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #f1f5f9;">
-        <tr><th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Product Module</th>
-            <th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Tracked Time</th></tr>
+        <tr><th style="text-align:left;padding:6px 10px;font-size:11px;color:#94a3b8;">Project Tracking</th>
+            <th style="text-align:right;padding:6px 10px;font-size:11px;color:#94a3b8;">Tracked Time</th></tr>
         {rows}
       </table>
     </div>'''
     if not tracking_html:
-        tracking_html = '<div style="color:#94a3b8;font-size:13px;">No time tracked this week.</div>'
+        tracking_html = '<div style="color:#94a3b8;font-size:13px;">No time tracked last week.</div>'
 
     # ── Section 3: Customer Support ──
     support_rows = ''
     for client_name, d in sorted(support.items()):
+        types = ', '.join(sorted(d['types'])) if d['types'] else '—'
         support_rows += (
             f'<tr><td style="padding:8px 12px;font-size:12px;color:#0f172a;font-weight:600;">{client_name}</td>'
+            f'<td style="padding:8px 12px;font-size:12px;color:#475569;">{types}</td>'
             f'<td style="padding:8px 12px;font-size:12px;text-align:center;">{d["total"]}</td>'
             f'<td style="padding:8px 12px;font-size:12px;text-align:center;color:#166534;">{d["resolved"]}</td>'
             f'<td style="padding:8px 12px;font-size:12px;text-align:center;color:#b45309;">{d["pending"]}</td>'
@@ -412,8 +500,8 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
             f'<td style="padding:8px 12px;font-size:12px;color:#64748b;">{", ".join(sorted(d["resources"]))}</td></tr>'
         )
     if not support_rows:
-        support_rows = ('<tr><td colspan="6" style="padding:12px;color:#94a3b8;font-size:13px;">'
-                         'No support tickets found.</td></tr>')
+        support_rows = ('<tr><td colspan="7" style="padding:12px;color:#94a3b8;font-size:13px;">'
+                        'No support ticket activity last week.</td></tr>')
 
     return f'''<!DOCTYPE html>
 <html lang="en">
@@ -424,13 +512,13 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
   <tr><td style="border-radius:20px 20px 0 0;overflow:hidden;background:linear-gradient(135deg,#0f2744 0%,#1a56a0 100%);padding:36px 32px;">
     <div style="color:#dbeafe;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">Weekly Ops Report &middot; {week_label}</div>
     <div style="color:#fff;font-size:28px;font-weight:800;">Weekly Report</div>
-    <div style="color:rgba(255,255,255,0.7);font-size:14px;margin-top:4px;">Sent {today_str}</div>
+    <div style="color:rgba(255,255,255,0.7);font-size:14px;margin-top:4px;">Sent {today_str} &middot; last week only</div>
   </td></tr>
   <tr><td style="height:4px;background:linear-gradient(90deg,#6366F1,#A855F7,#EC4899);"></td></tr>
 
   {_slab('&#128188; Onboarding', '#7c3aed')}
   <tr><td style="background:#fff;padding:20px 32px;">
-    {_section_title('Active Onboarding Clients')}
+    {_section_title(f'Active Onboarding Clients — {week_label}')}
     <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;">
       <tr style="background:#f5f3ff;">
         <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Client Name</th>
@@ -442,15 +530,16 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
     </table>
   </td></tr>
 
-  {_slab('&#128100; Resource → Product Module Tracking', '#1a56a0')}
-  <tr><td style="background:#fff;padding:20px 32px;">{_section_title(f'This Week — {week_label}')}{tracking_html}</td></tr>
+  {_slab('&#128100; Resource → Project Tracking', '#1a56a0')}
+  <tr><td style="background:#fff;padding:20px 32px;">{_section_title(f'Last Week — {week_label}')}{tracking_html}</td></tr>
 
   {_slab('&#127919; Customer Support', '#166534')}
   <tr><td style="background:#fff;padding:20px 32px 32px;border-radius:0 0 20px 20px;">
-    {_section_title('Tickets by Client')}
+    {_section_title(f'Tickets by Client — {week_label}')}
     <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;">
       <tr style="background:#f0fdf4;">
         <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Client</th>
+        <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Ticket Type</th>
         <th style="padding:8px 12px;font-size:11px;color:#64748b;">Total</th>
         <th style="padding:8px 12px;font-size:11px;color:#64748b;">Resolved</th>
         <th style="padding:8px 12px;font-size:11px;color:#64748b;">Pending</th>
@@ -459,6 +548,9 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
       </tr>
       {support_rows}
     </table>
+    <div style="font-size:11px;color:#94a3b8;margin-top:10px;">
+      Counts cover tickets created, updated, closed or time-tracked during {week_label} only.
+    </div>
   </td></tr>
 
 </table>
@@ -497,7 +589,11 @@ def main() -> None:
         team_id = client.get_team_id()
         print(f'Auto-detected team ID: {team_id}')
 
-    print('=== Weekly ClickUp Ops Report ===\n')
+    start_ms, end_ms = _last_week_range_ms()
+    print('=== Weekly ClickUp Ops Report ===')
+    print(f'Reporting window: {_last_week_display()}')
+    print(f'  {datetime.fromtimestamp(start_ms / 1000, tz=IST)} '
+          f'-> {datetime.fromtimestamp(end_ms / 1000, tz=IST)}\n')
 
     print('Fetching ALL root tasks (open + closed, no subtasks) workspace-wide...')
     all_tasks = fetch_workspace_tasks(client, team_id)
@@ -505,21 +601,30 @@ def main() -> None:
 
     print('Fetching support tickets (open + closed, no subtasks)...')
     support_tickets = fetch_support_tickets(client)
-    print(f'Total support tickets: {len(support_tickets)}\n')
+    print(f'Total support tickets in list: {len(support_tickets)}\n')
 
     person_task_ms = fetch_time_by_person_task(client, team_id)
     task_ms = _flatten_task_ms(person_task_ms)
-    print(f'Time entries found for {len(task_ms)} distinct task(s) across {len(person_task_ms)} people\n')
+    print(f'Time entries found for {len(task_ms)} distinct task(s) across '
+          f'{len(person_task_ms)} people\n')
 
-    onboarding = build_onboarding(all_tasks)
+    print('Applying strict last-week filter...')
+    onboarding = build_onboarding(all_tasks, task_ms)
     resource_tracking = build_resource_tracking(client, all_tasks, person_task_ms)
     support = build_customer_support(support_tickets, task_ms)
 
-    print(f'Summary: {len(onboarding)} client(s) onboarding, '
+    if _TICKET_TYPE_FIELDS_SEEN:
+        print(f'  Ticket Type read from custom field(s): '
+              f'{", ".join(sorted(_TICKET_TYPE_FIELDS_SEEN))}')
+    else:
+        print('  [warn] No "Ticket Type" custom field found on any ticket — '
+              'the Ticket Type column will show "—". Check the field name in ClickUp.')
+
+    print(f'\nSummary (last week only): {len(onboarding)} onboarding client(s), '
           f'{len(resource_tracking)} resource(s) with tracked time, '
           f'{len(support)} client(s) in support')
 
-    report_date = date.today()
+    report_date = datetime.now(IST).date()
     html = build_email_html(onboarding, resource_tracking, support, report_date)
     subject = f'Weekly Ops Report — {_last_week_display()}'
 
