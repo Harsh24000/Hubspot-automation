@@ -1,0 +1,618 @@
+#!/usr/bin/env python3
+"""
+Monthly ClickUp Ops Report
+Runs on the 1st of each month and reports the CALENDAR MONTH that just ended.
+(1 Sep -> August; 1 Aug -> July.)
+
+Output mirrors the team's reference spreadsheet exactly:
+
+    Sl No | Activity | TS by <Name> | ... | Total
+      1   | New Dev  |    47        | ... | 130.25
+                       ...
+          | Total    |   181.5      | ... | 553.85
+
+  - "Activity"  = the task's Product Module custom field.
+  - "Resource"  = the person who logged the time (ClickUp time-entry owner).
+  - "TS"        = Time Spent, in decimal hours (78, 9.5, 6.75, 46.6 ...),
+                  exactly how the reference sheet writes it. Zero renders as "-".
+
+Plus a team-wide donut of time spent per activity, and per-resource totals.
+
+ASSUMPTIONS
+- "Product Module" = a custom field whose name contains "module" or "product".
+  A task with none set is reported under "Unspecified" rather than dropped, so
+  the grand total always reconciles with ClickUp.
+- Subtasks inherit their parent's Product Module when they don't set one
+  themselves (same rule the weekly report uses).
+- Activity rows and resource columns are BOTH derived from the data and sorted
+  by total hours descending. Nothing is hardcoded, so a new module in ClickUp
+  shows up automatically.
+- Reporting window is IST (UTC+5:30): 1st 00:00:00.000 -> last day 23:59:59.999.
+
+ENV
+  CLICKUP_TOKEN              required
+  CLICKUP_WORKSPACE          optional (auto-detected)
+  GMAIL_ADDRESS              required
+  GMAIL_APP_PASSWORD         required
+  EMAIL_TO                   required, comma-separated
+  EMAIL_CC                   optional, comma-separated
+  REPORT_MONTH               optional 'YYYY-MM' override for backfills
+                             (e.g. REPORT_MONTH=2026-07 to re-send July)
+"""
+
+import os
+import sys
+import math
+import html
+import smtplib
+import calendar
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from typing import Dict, List, Tuple
+
+from clickup_client import ClickUpClient
+
+IST = timezone(timedelta(hours=5, minutes=30))
+UNSPECIFIED = 'Unspecified'
+
+# Categorical palette, fixed order, never cycled. Validated for colour-vision
+# deficiency separation on a light surface (worst adjacent CVD dE 9.1,
+# normal-vision dE 19.6). Three of these sit under 3:1 contrast on white, which
+# is why every segment also carries a visible label + value in the legend.
+SERIES_COLORS = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300']
+OTHER_COLOR = '#8a8a85'
+MAX_DONUT_SEGMENTS = 6   # part-to-whole reads at a glance only up to ~6 slices
+
+
+# -- Period ------------------------------------------------------------------
+
+def report_month() -> Tuple[int, int]:
+    """(year, month) to report on. Previous calendar month, or REPORT_MONTH."""
+    override = os.environ.get('REPORT_MONTH', '').strip()
+    if override:
+        try:
+            year_s, month_s = override.split('-')
+            year, month = int(year_s), int(month_s)
+            if not 1 <= month <= 12:
+                raise ValueError
+            return year, month
+        except (ValueError, IndexError):
+            raise SystemExit(f"REPORT_MONTH must look like '2026-07', got '{override}'")
+    today = datetime.now(IST).date()
+    first_of_this_month = today.replace(day=1)
+    last_of_prev_month = first_of_this_month - timedelta(days=1)
+    return last_of_prev_month.year, last_of_prev_month.month
+
+
+def month_range_ms(year: int, month: int) -> Tuple[int, int]:
+    """1st 00:00:00.000 IST through last-day 23:59:59.999 IST, as epoch ms."""
+    start = datetime(year, month, 1, 0, 0, 0, tzinfo=IST)
+    last_day = calendar.monthrange(year, month)[1]
+    end = datetime(year, month, last_day, 23, 59, 59, 999000, tzinfo=IST)
+    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+
+
+def month_label(year: int, month: int) -> str:
+    return f'{calendar.month_name[month]} {year}'
+
+
+def month_range_label(year: int, month: int) -> str:
+    last_day = calendar.monthrange(year, month)[1]
+    abbr = calendar.month_abbr[month]
+    return f'1 {abbr} - {last_day} {abbr} {year}'
+
+
+# -- Formatting --------------------------------------------------------------
+
+def hours(ms: int) -> float:
+    """Milliseconds -> decimal hours, rounded to 2dp like the reference sheet."""
+    return round(int(ms) / 3600000.0, 2)
+
+
+def fmt_hours(value: float, dash_on_zero: bool = True) -> str:
+    """78.0 -> '78', 9.50 -> '9.5', 553.85 -> '553.85', 0 -> '-'."""
+    if not value:
+        return '-' if dash_on_zero else '0'
+    text = f'{value:.2f}'.rstrip('0').rstrip('.')
+    return text or '0'
+
+
+def esc(text) -> str:
+    return html.escape(str(text if text is not None else ''), quote=True)
+
+
+# -- Product module extraction ----------------------------------------------
+
+def product_module_name(task: dict) -> str:
+    """Read 'Product Module' off a custom field (drop_down / labels / text)."""
+    for field in (task.get('custom_fields') or []):
+        name_lower = (field.get('name') or '').lower()
+        if 'module' not in name_lower and 'product' not in name_lower:
+            continue
+        value = field.get('value')
+        if value is None or value == '':
+            continue
+        field_type = field.get('type', '')
+        options = (field.get('type_config') or {}).get('options', [])
+        if field_type == 'drop_down':
+            for opt in options:
+                if str(opt.get('orderindex', '')) == str(value) or opt.get('id') == str(value):
+                    return (opt.get('name') or str(value)).strip()
+            try:
+                return options[int(value)]['name'].strip()
+            except (IndexError, ValueError, TypeError, KeyError):
+                return str(value).strip()
+        if field_type == 'labels':
+            matched = [o.get('name') for o in options if o.get('id') in (value or [])]
+            matched = [m for m in matched if m]
+            if matched:
+                return ', '.join(matched)
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ''
+
+
+# -- Data collection ---------------------------------------------------------
+
+def fetch_time_by_person_task(client: ClickUpClient, team_id: str,
+                              start_ms: int, end_ms: int) -> Dict[str, Dict[str, int]]:
+    """resource username -> {task_id: total_ms} for the reporting month."""
+    members = client.get_workspace_members(team_id)
+    print(f'Fetching time entries for {len(members)} workspace member(s)...')
+
+    person_task_ms: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    seen_entry_ids = set()   # a member can appear twice; never double-count an entry
+
+    for member in members:
+        uid = member.get('id')
+        username = (member.get('username') or member.get('email') or '').strip()
+        if not uid or not username:
+            continue
+        try:
+            entries = client.get_time_entries(team_id, start_ms, end_ms, assignee_id=uid)
+        except Exception as exc:
+            print(f'  [warn] Could not fetch time entries for {username}: {exc}')
+            continue
+
+        for entry in entries:
+            entry_id = entry.get('id')
+            if entry_id and entry_id in seen_entry_ids:
+                continue
+            if entry_id:
+                seen_entry_ids.add(entry_id)
+            task_id = (entry.get('task') or {}).get('id')
+            try:
+                duration = int(entry.get('duration', 0))
+            except (TypeError, ValueError):
+                duration = 0
+            if task_id and duration > 0:
+                person_task_ms[username][task_id] += duration
+
+        logged = sum(person_task_ms[username].values())
+        if logged:
+            print(f'  {username}: {fmt_hours(hours(logged))}h across '
+                  f'{len(person_task_ms[username])} task(s)')
+
+    # Reading person_task_ms[username] above inserts an empty entry for members
+    # who logged nothing (defaultdict). Drop them, so "no time tracked at all"
+    # is an empty dict rather than a dict full of empty dicts.
+    return {person: tasks for person, tasks in person_task_ms.items() if tasks}
+
+
+def fetch_workspace_tasks(client: ClickUpClient, team_id: str) -> list:
+    """All root tasks (open + closed) workspace-wide — the bulk module source.
+
+    Far cheaper than looking every task up one at a time: a handful of list
+    calls returns thousands of tasks, and only the leftovers (subtasks) then
+    need an individual lookup.
+    """
+    all_tasks = []
+    spaces = client.get_spaces(team_id)
+    print(f'Scanning {len(spaces)} space(s) for task metadata...')
+    for space in spaces:
+        lists = client.get_all_lists(space['id'])
+        print(f'  Space: {space.get("name", "?")} - {len(lists)} list(s)')
+        for lst in lists:
+            try:
+                tasks = client.get_tasks(lst['id'], include_closed=True, include_subtasks=False)
+            except Exception as exc:
+                print(f'    [warn] Could not fetch list {lst.get("name", lst["id"])}: {exc}')
+                continue
+            all_tasks.extend(tasks)
+    return all_tasks
+
+
+def build_module_resolver(client: ClickUpClient, all_tasks: list):
+    """task_id -> activity name, with a parent fallback for subtasks."""
+    task_by_id = {t['id']: t for t in all_tasks}
+    lookup_cache: Dict[str, dict] = {}
+
+    def resolve_task(task_id: str):
+        if task_id in task_by_id:
+            return task_by_id[task_id]
+        if task_id in lookup_cache:
+            return lookup_cache[task_id]
+        try:
+            fetched = client._get(f'task/{task_id}')
+        except Exception as exc:
+            print(f'  [warn] Could not look up task {task_id}: {exc}')
+            fetched = None
+        lookup_cache[task_id] = fetched
+        return fetched
+
+    def resolve(task_id: str) -> str:
+        task = resolve_task(task_id)
+        if not task:
+            return UNSPECIFIED
+        module = product_module_name(task)
+        if module:
+            return module
+        parent_id = task.get('parent')
+        if parent_id:
+            parent = resolve_task(parent_id)
+            if parent:
+                parent_module = product_module_name(parent)
+                if parent_module:
+                    return parent_module
+        return UNSPECIFIED
+
+    return resolve
+
+
+def build_matrix(person_task_ms: Dict[str, Dict[str, int]], resolve_module) -> dict:
+    """Pivot into the Project x Resource grid the reference sheet uses."""
+    cell_ms: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    project_ms: Dict[str, int] = defaultdict(int)
+    resource_ms: Dict[str, int] = defaultdict(int)
+
+    distinct_tasks = {tid for tasks in person_task_ms.values() for tid in tasks}
+    print(f'Resolving project (Product Module) for {len(distinct_tasks)} distinct task(s)...')
+
+    for person, task_times in person_task_ms.items():
+        for task_id, ms in task_times.items():
+            project = resolve_module(task_id)
+            cell_ms[project][person] += ms
+            project_ms[project] += ms
+            resource_ms[person] += ms
+
+    # Both axes dynamic, sorted by total time descending; ties broken by name so
+    # the layout is stable when two rows are equal.
+    projects = sorted(project_ms, key=lambda p: (-project_ms[p], p.lower()))
+    resources = sorted(resource_ms, key=lambda r: (-resource_ms[r], r.lower()))
+    grand_ms = sum(resource_ms.values())
+
+    return {
+        'projects': projects,
+        'resources': resources,
+        'cell_hours': {p: {r: hours(cell_ms[p].get(r, 0)) for r in resources} for p in projects},
+        'project_hours': {p: hours(project_ms[p]) for p in projects},
+        'resource_hours': {r: hours(resource_ms[r]) for r in resources},
+        'grand_hours': hours(grand_ms),
+    }
+
+
+# -- Chart + chrome ----------------------------------------------------------
+
+def donut_segments(matrix: dict) -> List[Tuple[str, float, str]]:
+    """Top projects by hours, tail folded into 'Other'. Never cycles hues."""
+    projects = matrix['projects']
+    project_hours = matrix['project_hours']
+    ranked = [(p, project_hours[p]) for p in projects if project_hours[p] > 0]
+
+    if len(ranked) <= MAX_DONUT_SEGMENTS:
+        head, tail = ranked, []
+    else:
+        head, tail = ranked[:MAX_DONUT_SEGMENTS - 1], ranked[MAX_DONUT_SEGMENTS - 1:]
+
+    segments = [(name, hrs, SERIES_COLORS[i]) for i, (name, hrs) in enumerate(head)]
+    if tail:
+        segments.append((f'Other ({len(tail)} projects)', round(sum(h for _, h in tail), 2), OTHER_COLOR))
+    return segments
+
+
+def donut_svg(segments: List[Tuple[str, float, str]], total: float,
+              size: int = 210, thickness: int = 34) -> str:
+    """Inline-SVG donut. A 2px surface gap separates neighbouring segments."""
+    if not segments or total <= 0:
+        return ''
+    cx = cy = size / 2
+    radius = (size - thickness) / 2
+    circumference = 2 * math.pi * radius
+    gap = 2.0 if len(segments) > 1 else 0.0
+
+    arcs = []
+    angle = -90.0
+    for _, value, color in segments:
+        if value <= 0:
+            continue
+        fraction = value / total
+        dash = max(fraction * circumference - gap, 0.6)
+        arcs.append(
+            f'<circle cx="{cx}" cy="{cy}" r="{radius:.2f}" fill="none" stroke="{color}" '
+            f'stroke-width="{thickness}" stroke-dasharray="{dash:.2f} {circumference:.2f}" '
+            f'transform="rotate({angle:.2f} {cx} {cy})"></circle>'
+        )
+        angle += fraction * 360.0
+
+    return (
+        f'<svg width="{size}" height="{size}" viewBox="0 0 {size} {size}" '
+        f'xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Time spent by activity">'
+        f'<circle cx="{cx}" cy="{cy}" r="{radius:.2f}" fill="none" stroke="#eef1f5" '
+        f'stroke-width="{thickness}"></circle>'
+        + ''.join(arcs) +
+        f'<text x="{cx}" y="{cy - 4}" text-anchor="middle" font-family="Arial,Helvetica,sans-serif" '
+        f'font-size="26" font-weight="700" fill="#0f172a">{esc(fmt_hours(total))}</text>'
+        f'<text x="{cx}" y="{cy + 16}" text-anchor="middle" font-family="Arial,Helvetica,sans-serif" '
+        f'font-size="11" fill="#64748b">TOTAL HOURS</text>'
+        f'</svg>'
+    )
+
+
+def share_bar_rows(segments: List[Tuple[str, float, str]], total: float) -> str:
+    """Legend + share bars. Carries the full story on its own, so the chart
+    still reads if a mail client strips the inline SVG."""
+    rows = ''
+    for name, value, color in segments:
+        pct = (value / total * 100) if total else 0
+        width = max(2, round(pct))
+        rows += (
+            f'<tr>'
+            f'<td style="padding:7px 10px 7px 0;white-space:nowrap;">'
+            f'<span style="display:inline-block;width:10px;height:10px;border-radius:3px;'
+            f'background:{color};margin-right:8px;"></span>'
+            f'<span style="font-size:13px;color:#0f172a;">{esc(name)}</span></td>'
+            f'<td style="padding:7px 0;width:100%;">'
+            f'<div style="background:#eef1f5;border-radius:4px;height:10px;">'
+            f'<div style="width:{width}%;background:{color};height:10px;border-radius:4px;"></div>'
+            f'</div></td>'
+            f'<td style="padding:7px 0 7px 12px;white-space:nowrap;text-align:right;'
+            f'font-size:13px;color:#0f172a;font-weight:700;">{esc(fmt_hours(value))}h</td>'
+            f'<td style="padding:7px 0 7px 10px;white-space:nowrap;text-align:right;'
+            f'font-size:12px;color:#64748b;">{pct:.1f}%</td>'
+            f'</tr>'
+        )
+    return rows
+
+
+def _slab(label: str, color: str) -> str:
+    return (f'<tr><td style="background:{color};padding:10px 32px;">'
+            f'<div style="color:#fff;font-size:11px;font-weight:700;text-transform:uppercase;'
+            f'letter-spacing:2px;">{label}</div></td></tr>')
+
+
+def _section_title(label: str) -> str:
+    return (f'<div style="font-size:12px;font-weight:700;color:#0f2744;text-transform:uppercase;'
+            f'letter-spacing:1.5px;margin-bottom:14px;">&#9632; {esc(label)}</div>')
+
+
+def _stat_tile(value: str, label: str) -> str:
+    return (f'<td width="25%" align="center" style="padding:16px 8px;background:#f8fafc;'
+            f'border-right:1px solid #e8edf3;">'
+            f'<div style="font-size:22px;font-weight:800;color:#0f2744;">{esc(value)}</div>'
+            f'<div style="font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;'
+            f'letter-spacing:1px;margin-top:4px;">{esc(label)}</div></td>')
+
+
+# -- HTML --------------------------------------------------------------------
+
+def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime) -> str:
+    projects = matrix['projects']
+    resources = matrix['resources']
+    grand = matrix['grand_hours']
+    label = month_label(year, month)
+    range_label = month_range_label(year, month)
+
+    if not projects:
+        body = ('<tr><td style="background:#fff;padding:32px;border-radius:0 0 20px 20px;'
+                'color:#94a3b8;font-size:14px;">No time was tracked in ClickUp for this '
+                'period.</td></tr>')
+    else:
+        # -- Matrix -------------------------------------------------------
+        head = ('<tr style="background:#eef4fc;">'
+                '<th style="text-align:left;padding:9px 10px;font-size:11px;color:#475569;'
+                'border-bottom:1px solid #dbe4ef;">S. No</th>'
+                '<th style="text-align:left;padding:9px 10px;font-size:11px;color:#475569;'
+                'border-bottom:1px solid #dbe4ef;">Project</th>')
+        for resource in resources:
+            head += (f'<th style="text-align:right;padding:9px 10px;font-size:11px;color:#475569;'
+                     f'border-bottom:1px solid #dbe4ef;white-space:nowrap;">'
+                     f'{esc(resource)}</th>')
+        head += ('<th style="text-align:right;padding:9px 10px;font-size:11px;color:#0f2744;'
+                 'border-bottom:1px solid #dbe4ef;background:#e3ecf8;">Total</th></tr>')
+
+        rows = ''
+        for index, project in enumerate(projects, start=1):
+            stripe = '#ffffff' if index % 2 else '#fbfcfe'
+            rows += (f'<tr style="background:{stripe};">'
+                     f'<td style="padding:8px 10px;font-size:12px;color:#94a3b8;'
+                     f'border-bottom:1px solid #f1f5f9;">{index}</td>'
+                     f'<td style="padding:8px 10px;font-size:13px;color:#0f172a;font-weight:600;'
+                     f'border-bottom:1px solid #f1f5f9;">{esc(project)}</td>')
+            for resource in resources:
+                value = matrix['cell_hours'][project].get(resource, 0)
+                color = '#0f172a' if value else '#cbd5e1'
+                rows += (f'<td style="padding:8px 10px;font-size:13px;text-align:right;'
+                         f'color:{color};border-bottom:1px solid #f1f5f9;">'
+                         f'{esc(fmt_hours(value))}</td>')
+            rows += (f'<td style="padding:8px 10px;font-size:13px;text-align:right;'
+                     f'font-weight:700;color:#0f2744;background:#f5f9ff;'
+                     f'border-bottom:1px solid #f1f5f9;">'
+                     f'{esc(fmt_hours(matrix["project_hours"][project]))}</td></tr>')
+
+        total_row = ('<tr style="background:#eef4fc;">'
+                     '<td style="padding:10px;"></td>'
+                     '<td style="padding:10px;font-size:13px;font-weight:800;color:#0f2744;'
+                     'text-align:right;">Total</td>')
+        for resource in resources:
+            total_row += (f'<td style="padding:10px;font-size:13px;text-align:right;'
+                          f'font-weight:800;color:#0f2744;">'
+                          f'{esc(fmt_hours(matrix["resource_hours"][resource]))}</td>')
+        total_row += (f'<td style="padding:10px;font-size:13px;text-align:right;font-weight:800;'
+                      f'color:#fff;background:#1a56a0;">{esc(fmt_hours(grand))}</td></tr>')
+
+        matrix_html = (
+            '<div style="overflow-x:auto;">'
+            '<table width="100%" cellpadding="0" cellspacing="0" '
+            'style="border:1px solid #dbe4ef;border-radius:8px;overflow:hidden;">'
+            f'{head}{rows}{total_row}</table></div>'
+            '<div style="font-size:11px;color:#94a3b8;margin-top:10px;">'
+            'All figures are time spent, in hours. &ldquo;-&rdquo; means no time logged.</div>'
+        )
+
+        # -- Donut --------------------------------------------------------
+        segments = donut_segments(matrix)
+        donut_html = f'''
+    <table width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td width="230" valign="middle" align="center" style="padding-right:18px;">
+          {donut_svg(segments, grand)}
+        </td>
+        <td valign="middle">
+          <table width="100%" cellpadding="0" cellspacing="0">{share_bar_rows(segments, grand)}</table>
+        </td>
+      </tr>
+    </table>'''
+
+        # -- Resource totals ----------------------------------------------
+        top_resource_hours = matrix['resource_hours'][resources[0]] if resources else 0
+        resource_rows = ''
+        for resource in resources:
+            value = matrix['resource_hours'][resource]
+            pct_of_total = (value / grand * 100) if grand else 0
+            width = max(2, round((value / top_resource_hours * 100) if top_resource_hours else 0))
+            resource_rows += (
+                f'<tr>'
+                f'<td style="padding:7px 12px 7px 0;white-space:nowrap;font-size:13px;'
+                f'color:#0f172a;font-weight:600;">{esc(resource)}</td>'
+                f'<td style="padding:7px 0;width:100%;">'
+                f'<div style="background:#eef1f5;border-radius:4px;height:10px;">'
+                f'<div style="width:{width}%;background:#2a78d6;height:10px;border-radius:4px;"></div>'
+                f'</div></td>'
+                f'<td style="padding:7px 0 7px 12px;text-align:right;white-space:nowrap;'
+                f'font-size:13px;font-weight:700;color:#0f172a;">{esc(fmt_hours(value))}h</td>'
+                f'<td style="padding:7px 0 7px 10px;text-align:right;white-space:nowrap;'
+                f'font-size:12px;color:#64748b;">{pct_of_total:.1f}%</td>'
+                f'</tr>'
+            )
+
+        avg = round(grand / len(resources), 2) if resources else 0
+        stats = (f'<tr>{_stat_tile(fmt_hours(grand), "Total Hours")}'
+                 f'{_stat_tile(str(len(resources)), "Resources")}'
+                 f'{_stat_tile(str(len(projects)), "Projects")}'
+                 f'{_stat_tile(fmt_hours(avg), "Avg / Resource")}</tr>')
+
+        body = f'''
+  <tr><td style="background:#fff;padding:0;"><table width="100%" cellpadding="0" cellspacing="0">{stats}</table></td></tr>
+
+  {_slab('&#128202; Project &times; Resource', '#1a56a0')}
+  <tr><td style="background:#fff;padding:20px 32px;">
+    {_section_title(f'Time spent - {label}')}
+    {matrix_html}
+  </td></tr>
+
+  {_slab('&#9201; Time Spent by Project', '#7c3aed')}
+  <tr><td style="background:#fff;padding:20px 32px;">
+    {_section_title('Share of total hours')}
+    {donut_html}
+  </td></tr>
+
+  {_slab('&#128100; Hours by Resource', '#166534')}
+  <tr><td style="background:#fff;padding:20px 32px 32px;border-radius:0 0 20px 20px;">
+    {_section_title('Total logged per person')}
+    <table width="100%" cellpadding="0" cellspacing="0">{resource_rows}</table>
+  </td></tr>'''
+
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:20px;background:#f1f5f9;font-family:Arial,Helvetica,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="max-width:760px;margin:0 auto;">
+
+  <tr><td style="border-radius:20px 20px 0 0;overflow:hidden;background:linear-gradient(135deg,#0f2744 0%,#1a56a0 100%);padding:36px 32px;">
+    <div style="color:#dbeafe;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">Monthly Ops Report &middot; {esc(range_label)}</div>
+    <div style="color:#fff;font-size:28px;font-weight:800;">{esc(label)}</div>
+    <div style="color:rgba(255,255,255,0.7);font-size:14px;margin-top:4px;">Sent {esc(sent_on.strftime('%A, %d %B %Y'))}</div>
+  </td></tr>
+  <tr><td style="height:4px;background:linear-gradient(90deg,#6366F1,#A855F7,#EC4899);"></td></tr>
+{body}
+
+</table>
+</body>
+</html>'''
+
+
+# -- Email -------------------------------------------------------------------
+
+def send_email(html_body: str, subject: str, cfg: dict) -> None:
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = subject
+    msg['From'] = cfg['from']
+    msg['To'] = cfg['to']
+    if cfg.get('cc'):
+        msg['Cc'] = cfg['cc']
+    msg.attach(MIMEText(html_body, 'html'))
+
+    recipients = [a.strip() for a in cfg['to'].split(',') if a.strip()]
+    recipients += [a.strip() for a in (cfg.get('cc') or '').split(',') if a.strip()]
+
+    print(f'Sending email via Gmail SMTP to: {", ".join(recipients)}')
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+        server.login(cfg['from'], cfg['app_password'])
+        server.sendmail(cfg['from'], recipients, msg.as_string())
+    print('Email sent successfully!')
+
+
+# -- Entry point -------------------------------------------------------------
+
+def main() -> None:
+    api_token = os.environ['CLICKUP_TOKEN']
+    team_id = os.environ.get('CLICKUP_WORKSPACE', '').strip()
+    gmail_from = os.environ['GMAIL_ADDRESS']
+    gmail_password = os.environ['GMAIL_APP_PASSWORD']
+    email_to = os.environ['EMAIL_TO']
+    email_cc = os.environ.get('EMAIL_CC', '').strip()
+
+    year, month = report_month()
+    start_ms, end_ms = month_range_ms(year, month)
+
+    print(f'=== Monthly ClickUp Ops Report - {month_label(year, month)} ===')
+    print(f'Window: {datetime.fromtimestamp(start_ms / 1000, tz=IST)} '
+          f'-> {datetime.fromtimestamp(end_ms / 1000, tz=IST)}\n')
+
+    client = ClickUpClient(api_token)
+    if not team_id:
+        team_id = client.get_team_id()
+        print(f'Auto-detected team ID: {team_id}')
+
+    person_task_ms = fetch_time_by_person_task(client, team_id, start_ms, end_ms)
+    if not person_task_ms:
+        print('No time entries found for this month — nothing to report.')
+
+    all_tasks = fetch_workspace_tasks(client, team_id) if person_task_ms else []
+    print(f'Task metadata cached for {len(all_tasks)} root task(s)\n')
+
+    resolve_module = build_module_resolver(client, all_tasks)
+    matrix = build_matrix(person_task_ms, resolve_module)
+
+    print(f'\nSummary: {len(matrix["activities"])} activity/activities, '
+          f'{len(matrix["resources"])} resource(s), '
+          f'{fmt_hours(matrix["grand_hours"])}h total')
+
+    sent_on = datetime.now(IST)
+    html_body = build_email_html(matrix, year, month, sent_on)
+    subject = f'Monthly Ops Report - {month_label(year, month)}'
+
+    send_email(html_body, subject, {
+        'from': gmail_from,
+        'app_password': gmail_password,
+        'to': email_to,
+        'cc': email_cc,
+    })
+
+
+if __name__ == '__main__':
+    main()
