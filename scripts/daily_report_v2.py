@@ -28,7 +28,9 @@ def pdf_safe(text):
 HUBSPOT_TOKEN      = os.environ['HUBSPOT_TOKEN']
 GMAIL_ADDRESS      = os.environ['GMAIL_ADDRESS']
 GMAIL_APP_PASSWORD = os.environ['GMAIL_APP_PASSWORD']
-RECIPIENT_EMAIL    = os.environ['RECIPIENT_EMAIL']
+# Recipients are hardcoded in RECIPIENTS near the bottom of this file. The
+# RECIPIENT_EMAIL secret is no longer read here — the workflow may still pass
+# it, and it is simply ignored.
 GOOGLE_SA_JSON     = json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT_JSON'])
 CLICKUP_TOKEN      = os.environ['CLICKUP_TOKEN']
 CLICKUP_LIST_ID    = '901615411023'
@@ -1188,7 +1190,13 @@ def format_pdf(data, calendar_days, ai_briefing='', clickup_tickets=None):
 
 # ── Email ─────────────────────────────────────────────────────────────────────
 
-RECIPIENTS = [RECIPIENT_EMAIL, 'joyneel@niroggyan.com']
+# Who receives the Daily Pulse. To add or remove someone, edit THIS LIST ONLY —
+# it is the single place recipients are defined.
+RECIPIENTS = [
+    'operations@niroggyan.com',
+    'joyneel@niroggyan.com',
+    'shweta@niroggyan.com',
+]
 
 
 def send_email(subject, html_body, pdf_bytes, date_str):
