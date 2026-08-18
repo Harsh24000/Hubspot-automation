@@ -21,12 +21,18 @@ jobs:
       - name: Set today's date
         run: echo "TODAY=$(date -u '+%Y-%m-%d')" >> $GITHUB_ENV
 
-      - name: Restore morning snapshot
+      # The morning plan is OPTIONAL. fail-on-cache-miss used to be true, which
+      # killed this job before Python even started whenever the morning report
+      # had not run — or had run and sent nothing. The evening report's real
+      # job is "what time was logged today", which ClickUp answers on its own,
+      # so a missing snapshot now only costs the planned/unplanned split.
+      - name: Restore morning snapshot (optional)
+        continue-on-error: true
         uses: actions/cache/restore@v4
         with:
           path: scripts/clickup_dailymail/morning_snapshot.json
           key: morning-snapshot-${{ env.TODAY }}
-          fail-on-cache-miss: true
+          fail-on-cache-miss: false
 
       - name: Run evening report
         working-directory: scripts/clickup_dailymail
