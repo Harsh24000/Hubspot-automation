@@ -47,6 +47,7 @@ import math
 import html
 import smtplib
 import calendar
+import colorsys
 from io import BytesIO
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -65,8 +66,6 @@ UNSPECIFIED = 'Unspecified'
 # normal-vision dE 19.6). Three of these sit under 3:1 contrast on white, which
 # is why every segment also carries a visible label + value in the legend.
 SERIES_COLORS = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300']
-OTHER_COLOR = '#8a8a85'
-MAX_DONUT_SEGMENTS = 6   # part-to-whole reads at a glance only up to ~6 slices
 
 
 # -- Period ------------------------------------------------------------------
@@ -300,21 +299,41 @@ def build_matrix(person_task_ms: Dict[str, Dict[str, int]], resolve_module) -> d
 
 # -- Chart + chrome ----------------------------------------------------------
 
+def project_colors(count: int) -> List[str]:
+    """A distinct colour for every project.
+
+    The first six come from the validated categorical palette (highest
+    colour-vision-deficiency separation, used for the projects that dominate
+    the month). Beyond that, hues are walked in golden-angle steps with the
+    lightness/saturation tier rotating each time, which spreads an arbitrary
+    number of extra colours around the wheel without two neighbours landing on
+    the same shade.
+    """
+    if count <= len(SERIES_COLORS):
+        return SERIES_COLORS[:count]
+
+    colors = list(SERIES_COLORS)
+    golden_ratio = 0.618033988749895
+    # Tiers alternate light/dark so consecutive generated colours differ in
+    # brightness as well as hue — that survives greyscale printing too.
+    tiers = [(0.60, 0.50), (0.48, 0.65), (0.70, 0.38), (0.38, 0.57)]
+    hue = 0.11
+    index = 0
+    while len(colors) < count:
+        hue = (hue + golden_ratio) % 1.0
+        saturation, lightness = tiers[index % len(tiers)]
+        red, green, blue = colorsys.hls_to_rgb(hue, lightness, saturation)
+        colors.append('#%02x%02x%02x' % (round(red * 255), round(green * 255), round(blue * 255)))
+        index += 1
+    return colors
+
+
 def donut_segments(matrix: dict) -> List[Tuple[str, float, str]]:
-    """Top projects by hours, tail folded into 'Other'. Never cycles hues."""
-    projects = matrix['projects']
+    """EVERY project as its own slice — nothing is folded into 'Other'."""
     project_hours = matrix['project_hours']
-    ranked = [(p, project_hours[p]) for p in projects if project_hours[p] > 0]
-
-    if len(ranked) <= MAX_DONUT_SEGMENTS:
-        head, tail = ranked, []
-    else:
-        head, tail = ranked[:MAX_DONUT_SEGMENTS - 1], ranked[MAX_DONUT_SEGMENTS - 1:]
-
-    segments = [(name, hrs, SERIES_COLORS[i]) for i, (name, hrs) in enumerate(head)]
-    if tail:
-        segments.append((f'Other ({len(tail)} projects)', round(sum(h for _, h in tail), 2), OTHER_COLOR))
-    return segments
+    ranked = [(p, project_hours[p]) for p in matrix['projects'] if project_hours[p] > 0]
+    palette = project_colors(len(ranked))
+    return [(name, hrs, palette[i]) for i, (name, hrs) in enumerate(ranked)]
 
 
 def donut_png(segments: List[Tuple[str, float, str]], total: float,
@@ -341,7 +360,15 @@ def donut_png(segments: List[Tuple[str, float, str]], total: float,
 
     canvas = size * supersample
     ring = thickness * supersample
-    gap_degrees = 1.2 if len(segments) > 1 else 0.0
+    # With many projects each slice is only a few degrees wide, so a fixed
+    # 1.2-degree gap would eat the smallest ones entirely. Shrink it as the
+    # slice count grows.
+    if len(segments) <= 1:
+        gap_degrees = 0.0
+    elif len(segments) <= 8:
+        gap_degrees = 1.2
+    else:
+        gap_degrees = 0.5
 
     image = Image.new('RGB', (canvas, canvas), '#ffffff')
     draw = ImageDraw.Draw(image)
@@ -368,29 +395,86 @@ def donut_png(segments: List[Tuple[str, float, str]], total: float,
 
 
 def share_bar_rows(segments: List[Tuple[str, float, str]], total: float) -> str:
-    """Legend + share bars. Carries the full story on its own, so the chart
-    still reads if a mail client strips the inline SVG."""
+    """Donut legend: colour, name, hours, percent, then the bar.
+
+    The hours and percent columns come BEFORE the bar deliberately. When the
+    bar column carried width:100% and sat in the middle, it expanded and pushed
+    the numbers off the right edge in narrower mail windows — the figures were
+    in the HTML but invisible. Numbers first means they can never be clipped;
+    the bar is decoration and is the only thing that gets squeezed.
+    """
     rows = ''
     for name, value, color in segments:
         pct = (value / total * 100) if total else 0
         width = max(2, round(pct))
         rows += (
             f'<tr>'
-            f'<td style="padding:7px 10px 7px 0;white-space:nowrap;">'
-            f'<span style="display:inline-block;width:10px;height:10px;border-radius:3px;'
-            f'background:{color};margin-right:8px;"></span>'
+            # nowrap on the CELL, not just the text — otherwise the browser is
+            # free to break between the colour swatch and the label, dropping
+            # longer project names onto a second line.
+            f'<td style="padding:7px 14px 7px 0;white-space:nowrap;">'
+            f'<span style="display:inline-block;width:11px;height:11px;border-radius:3px;'
+            f'background:{color};margin-right:9px;"></span>'
             f'<span style="font-size:13px;color:#0f172a;">{esc(name)}</span></td>'
-            f'<td style="padding:7px 0;width:100%;">'
+            f'<td width="70" style="padding:7px 0;white-space:nowrap;text-align:right;'
+            f'font-size:13px;color:#0f172a;font-weight:700;">{esc(fmt_hours(value))}h</td>'
+            f'<td width="56" style="padding:7px 0 7px 10px;white-space:nowrap;text-align:right;'
+            f'font-size:12px;color:#64748b;">{pct:.1f}%</td>'
+            f'<td style="padding:7px 0 7px 14px;width:100%;min-width:60px;">'
             f'<div style="background:#eef1f5;border-radius:4px;height:10px;">'
             f'<div style="width:{width}%;background:{color};height:10px;border-radius:4px;"></div>'
             f'</div></td>'
-            f'<td style="padding:7px 0 7px 12px;white-space:nowrap;text-align:right;'
-            f'font-size:13px;color:#0f172a;font-weight:700;">{esc(fmt_hours(value))}h</td>'
-            f'<td style="padding:7px 0 7px 10px;white-space:nowrap;text-align:right;'
-            f'font-size:12px;color:#64748b;">{pct:.1f}%</td>'
             f'</tr>'
         )
     return rows
+
+
+def all_projects_table(matrix: dict) -> str:
+    """Every project with hours and share — nothing folded into 'Other'."""
+    projects = matrix['projects']
+    project_hours = matrix['project_hours']
+    grand = matrix['grand_hours']
+    if not projects:
+        return ''
+
+    rows = ''
+    for index, project in enumerate(projects, start=1):
+        value = project_hours[project]
+        pct = (value / grand * 100) if grand else 0
+        stripe = '#ffffff' if index % 2 else '#fbfcfe'
+        rows += (
+            f'<tr style="background:{stripe};">'
+            f'<td style="padding:7px 10px;font-size:12px;color:#94a3b8;'
+            f'border-bottom:1px solid #f1f5f9;">{index}</td>'
+            f'<td style="padding:7px 10px;font-size:13px;color:#0f172a;'
+            f'border-bottom:1px solid #f1f5f9;">{esc(project)}</td>'
+            f'<td style="padding:7px 10px;font-size:13px;text-align:right;font-weight:700;'
+            f'color:#0f2744;border-bottom:1px solid #f1f5f9;white-space:nowrap;">'
+            f'{esc(fmt_hours(value))}</td>'
+            f'<td style="padding:7px 10px;font-size:12px;text-align:right;color:#64748b;'
+            f'border-bottom:1px solid #f1f5f9;white-space:nowrap;">{pct:.1f}%</td></tr>'
+        )
+
+    return (
+        '<div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;'
+        'letter-spacing:1px;margin:22px 0 10px;">All projects &mdash; full breakdown</div>'
+        '<table width="100%" cellpadding="0" cellspacing="0" '
+        'style="border:1px solid #dbe4ef;border-radius:8px;overflow:hidden;">'
+        '<tr style="background:#f5f3ff;">'
+        '<th style="text-align:left;padding:8px 10px;font-size:11px;color:#475569;">S. No</th>'
+        '<th style="text-align:left;padding:8px 10px;font-size:11px;color:#475569;">Project</th>'
+        '<th style="text-align:right;padding:8px 10px;font-size:11px;color:#475569;">Hours</th>'
+        '<th style="text-align:right;padding:8px 10px;font-size:11px;color:#475569;">Share</th>'
+        f'</tr>{rows}'
+        f'<tr style="background:#eef4fc;">'
+        f'<td style="padding:9px 10px;"></td>'
+        f'<td style="padding:9px 10px;font-size:13px;font-weight:800;color:#0f2744;">Total</td>'
+        f'<td style="padding:9px 10px;font-size:13px;text-align:right;font-weight:800;'
+        f'color:#0f2744;">{esc(fmt_hours(grand))}</td>'
+        f'<td style="padding:9px 10px;font-size:12px;text-align:right;font-weight:800;'
+        f'color:#0f2744;">100.0%</td></tr>'
+        '</table>'
+    )
 
 
 def _slab(label: str, color: str) -> str:
@@ -485,27 +569,28 @@ def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime,
         # an option: Gmail strips <svg> and leaves its text nodes loose on the
         # page. If the image could not be built, the share bars alone still
         # carry the whole breakdown.
-        chart_cell = ''
+        # Donut on top, legend full-width underneath. Side by side, a legend
+        # with one row per project squeezes the name column until every label
+        # wraps onto two lines and the bars collapse to slivers.
+        chart_block = ''
         if has_chart:
-            chart_cell = f'''
-        <td width="240" valign="middle" align="center" style="padding-right:20px;">
-          <img src="cid:donutchart" width="210" height="210" alt="Time spent by project"
+            chart_block = f'''
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:22px;">
+      <tr>
+        <td align="center">
+          <img src="cid:donutchart" width="240" height="240" alt="Time spent by project"
                style="display:block;border:0;outline:none;text-decoration:none;">
-          <div style="font-size:20px;font-weight:800;color:#0f172a;margin-top:8px;">
+          <div style="font-size:22px;font-weight:800;color:#0f172a;margin-top:10px;">
             {esc(fmt_hours(grand))}
           </div>
           <div style="font-size:10px;font-weight:700;color:#64748b;letter-spacing:1px;">
             TOTAL HOURS
           </div>
-        </td>'''
-        donut_html = f'''
-    <table width="100%" cellpadding="0" cellspacing="0">
-      <tr>{chart_cell}
-        <td valign="middle">
-          <table width="100%" cellpadding="0" cellspacing="0">{share_bar_rows(segments, grand)}</table>
         </td>
       </tr>
     </table>'''
+        donut_html = f'''{chart_block}
+    <table width="100%" cellpadding="0" cellspacing="0">{share_bar_rows(segments, grand)}</table>'''
 
         # -- Resource totals ----------------------------------------------
         top_resource_hours = matrix['resource_hours'][resources[0]] if resources else 0
@@ -516,16 +601,18 @@ def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime,
             width = max(2, round((value / top_resource_hours * 100) if top_resource_hours else 0))
             resource_rows += (
                 f'<tr>'
-                f'<td style="padding:7px 12px 7px 0;white-space:nowrap;font-size:13px;'
+                # Numbers before the bar, same reason as the donut legend: a
+                # width:100% bar in the middle pushes them off the right edge.
+                f'<td style="padding:7px 12px 7px 0;font-size:13px;'
                 f'color:#0f172a;font-weight:600;">{esc(resource)}</td>'
-                f'<td style="padding:7px 0;width:100%;">'
+                f'<td width="76" style="padding:7px 0;text-align:right;white-space:nowrap;'
+                f'font-size:13px;font-weight:700;color:#0f172a;">{esc(fmt_hours(value))}h</td>'
+                f'<td width="56" style="padding:7px 0 7px 10px;text-align:right;white-space:nowrap;'
+                f'font-size:12px;color:#64748b;">{pct_of_total:.1f}%</td>'
+                f'<td style="padding:7px 0 7px 14px;width:100%;min-width:60px;">'
                 f'<div style="background:#eef1f5;border-radius:4px;height:10px;">'
                 f'<div style="width:{width}%;background:#2a78d6;height:10px;border-radius:4px;"></div>'
                 f'</div></td>'
-                f'<td style="padding:7px 0 7px 12px;text-align:right;white-space:nowrap;'
-                f'font-size:13px;font-weight:700;color:#0f172a;">{esc(fmt_hours(value))}h</td>'
-                f'<td style="padding:7px 0 7px 10px;text-align:right;white-space:nowrap;'
-                f'font-size:12px;color:#64748b;">{pct_of_total:.1f}%</td>'
                 f'</tr>'
             )
 
