@@ -44,6 +44,7 @@ ASSUMPTIONS
 """
 
 import os
+import re
 import sys
 import smtplib
 from collections import defaultdict
@@ -560,14 +561,32 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
 
 # ── Email sender ──────────────────────────────────────────────────────────────
 
+def _parse_addresses(raw) -> list:
+    """Split a recipient string on commas, semicolons OR whitespace/newlines.
+
+    GitHub secrets are frequently pasted one address per line. A raw newline
+    inside a To/Cc header makes Python 3.11 raise
+    HeaderWriteError: folded header contains newline
+    and the whole send fails after all the work is already done. Splitting on
+    whitespace too makes the script tolerant of however the secret is entered.
+    """
+    if not raw:
+        return []
+    return [a.strip() for a in re.split(r"[,;\s]+", str(raw)) if a.strip()]
+
+
 def send_email(html: str, subject: str, cfg: dict) -> None:
     msg = MIMEMultipart('alternative')
     msg['Subject'] = subject
     msg['From'] = cfg['from']
-    msg['To'] = cfg['to']
+    to_list = _parse_addresses(cfg.get('to'))
+    if not to_list:
+        raise SystemExit('No recipients configured — check the EMAIL_TO secret.')
+    # Never assign the raw secret to a header: a newline in it makes Python
+    # refuse to write the message at all.
+    msg['To'] = ', '.join(to_list)
     msg.attach(MIMEText(html, 'html'))
 
-    to_list = [a.strip() for a in cfg['to'].split(',') if a.strip()]
     print(f'Sending email via Gmail SMTP to: {", ".join(to_list)}')
     with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
         server.login(cfg['from'], cfg['app_password'])
