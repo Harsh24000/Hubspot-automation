@@ -383,27 +383,50 @@ def donut_png(segments: List[Tuple[str, float, str]], total: float,
     else:
         gap_degrees = 0.5
 
-    image = Image.new('RGB', (canvas, canvas), '#ffffff')
+    def rgb(hex_color: str):
+        """'#2a78d6' -> (42, 120, 214). Passed as a tuple rather than a string
+        so no Pillow build can mis-parse the colour."""
+        h = hex_color.lstrip('#')
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+    image = Image.new('RGB', (canvas, canvas), (255, 255, 255))
     draw = ImageDraw.Draw(image)
     box = [0, 0, canvas - 1, canvas - 1]
 
     # Track ring, so rounding gaps never show as white wedges.
-    draw.ellipse(box, fill='#eef1f5')
+    draw.ellipse(box, fill=(238, 241, 245))
 
     angle = -90.0
+    drawn = 0
     for _, value, color in segments:
         if value <= 0:
             continue
         sweep = value / total * 360.0
         draw.pieslice(box, angle + gap_degrees / 2, angle + sweep - gap_degrees / 2,
-                      fill=color)
+                      fill=rgb(color))
         angle += sweep
+        drawn += 1
 
-    draw.ellipse([ring, ring, canvas - 1 - ring, canvas - 1 - ring], fill='#ffffff')
+    draw.ellipse([ring, ring, canvas - 1 - ring, canvas - 1 - ring], fill=(255, 255, 255))
 
     image = image.resize((size, size), Image.LANCZOS)
+
+    # Prove, server-side, what actually landed in the pixels. If this reports a
+    # single colour the fault is here; if it reports many but the email shows
+    # one, the fault is in the mail client rendering the image.
+    try:
+        sampled = image.convert('RGB').getcolors(maxcolors=200000) or []
+        sampled = [c for c in sampled
+                   if c[1] not in ((255, 255, 255), (238, 241, 245))]
+        sampled.sort(reverse=True)
+        summary = ', '.join('#%02x%02x%02x(%d)' % (c[1][0], c[1][1], c[1][2], c[0])
+                            for c in sampled[:6])
+        print(f'  chart pixels: {len(sampled)} distinct colour(s); top: {summary}')
+    except Exception as exc:
+        print(f'  [warn] could not sample chart pixels: {exc}')
+
     buffer = BytesIO()
-    image.save(buffer, format='PNG', optimize=True)
+    image.save(buffer, format='PNG')
     return buffer.getvalue()
 
 
@@ -672,10 +695,18 @@ def send_email(html_body: str, subject: str, cfg: dict, chart_png=None) -> None:
     msg.attach(alternative)
 
     if chart_png:
-        image = MIMEImage(chart_png, _subtype='png')
-        image.add_header('Content-ID', '<donutchart>')
-        image.add_header('Content-Disposition', 'inline', filename='time-by-project.png')
-        msg.attach(image)
+        inline = MIMEImage(chart_png, _subtype='png')
+        inline.add_header('Content-ID', '<donutchart>')
+        inline.add_header('Content-Disposition', 'inline', filename='time-by-project.png')
+        msg.attach(inline)
+
+        # Same bytes again as a normal attachment. Some clients recolour or fail
+        # to render inline CID images; the attached copy can always be opened to
+        # see the real chart.
+        download = MIMEImage(chart_png, _subtype='png')
+        download.add_header('Content-Disposition', 'attachment',
+                            filename='time-by-project.png')
+        msg.attach(download)
 
     recipients = to_list + cc_list
 
