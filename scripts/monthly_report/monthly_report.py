@@ -41,14 +41,17 @@ ENV
 """
 
 import os
+import re
 import sys
 import math
 import html
 import smtplib
 import calendar
+from io import BytesIO
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
 from email.mime.text import MIMEText
 from typing import Dict, List, Tuple
 
@@ -314,42 +317,54 @@ def donut_segments(matrix: dict) -> List[Tuple[str, float, str]]:
     return segments
 
 
-def donut_svg(segments: List[Tuple[str, float, str]], total: float,
-              size: int = 210, thickness: int = 34) -> str:
-    """Inline-SVG donut. A 2px surface gap separates neighbouring segments."""
-    if not segments or total <= 0:
-        return ''
-    cx = cy = size / 2
-    radius = (size - thickness) / 2
-    circumference = 2 * math.pi * radius
-    gap = 2.0 if len(segments) > 1 else 0.0
+def donut_png(segments: List[Tuple[str, float, str]], total: float,
+              size: int = 420, thickness: int = 105, supersample: int = 3):
+    """Render the donut as a PNG, returned as raw bytes (or None).
 
-    arcs = []
+    It has to be a real image, not inline SVG: Gmail strips <svg> entirely,
+    which left the chart missing and its <text> labels dumped into the page as
+    stray words. A PNG attached with a Content-ID renders in Gmail, Outlook,
+    Apple Mail and every mobile client.
+
+    No text is drawn inside the image — the total is rendered as HTML beneath
+    it instead, so the output never depends on a font being installed on the
+    build runner.
+    """
+    if not segments or total <= 0:
+        return None
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        print('  [warn] Pillow not installed — donut image skipped '
+              '(the share bars still carry the full breakdown).')
+        return None
+
+    canvas = size * supersample
+    ring = thickness * supersample
+    gap_degrees = 1.2 if len(segments) > 1 else 0.0
+
+    image = Image.new('RGB', (canvas, canvas), '#ffffff')
+    draw = ImageDraw.Draw(image)
+    box = [0, 0, canvas - 1, canvas - 1]
+
+    # Track ring, so rounding gaps never show as white wedges.
+    draw.ellipse(box, fill='#eef1f5')
+
     angle = -90.0
     for _, value, color in segments:
         if value <= 0:
             continue
-        fraction = value / total
-        dash = max(fraction * circumference - gap, 0.6)
-        arcs.append(
-            f'<circle cx="{cx}" cy="{cy}" r="{radius:.2f}" fill="none" stroke="{color}" '
-            f'stroke-width="{thickness}" stroke-dasharray="{dash:.2f} {circumference:.2f}" '
-            f'transform="rotate({angle:.2f} {cx} {cy})"></circle>'
-        )
-        angle += fraction * 360.0
+        sweep = value / total * 360.0
+        draw.pieslice(box, angle + gap_degrees / 2, angle + sweep - gap_degrees / 2,
+                      fill=color)
+        angle += sweep
 
-    return (
-        f'<svg width="{size}" height="{size}" viewBox="0 0 {size} {size}" '
-        f'xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Time spent by project">'
-        f'<circle cx="{cx}" cy="{cy}" r="{radius:.2f}" fill="none" stroke="#eef1f5" '
-        f'stroke-width="{thickness}"></circle>'
-        + ''.join(arcs) +
-        f'<text x="{cx}" y="{cy - 4}" text-anchor="middle" font-family="Arial,Helvetica,sans-serif" '
-        f'font-size="26" font-weight="700" fill="#0f172a">{esc(fmt_hours(total))}</text>'
-        f'<text x="{cx}" y="{cy + 16}" text-anchor="middle" font-family="Arial,Helvetica,sans-serif" '
-        f'font-size="11" fill="#64748b">TOTAL HOURS</text>'
-        f'</svg>'
-    )
+    draw.ellipse([ring, ring, canvas - 1 - ring, canvas - 1 - ring], fill='#ffffff')
+
+    image = image.resize((size, size), Image.LANCZOS)
+    buffer = BytesIO()
+    image.save(buffer, format='PNG', optimize=True)
+    return buffer.getvalue()
 
 
 def share_bar_rows(segments: List[Tuple[str, float, str]], total: float) -> str:
@@ -399,7 +414,8 @@ def _stat_tile(value: str, label: str) -> str:
 
 # -- HTML --------------------------------------------------------------------
 
-def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime) -> str:
+def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime,
+                     has_chart: bool = False) -> str:
     projects = matrix['projects']
     resources = matrix['resources']
     grand = matrix['grand_hours']
@@ -465,12 +481,26 @@ def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime) -> 
 
         # -- Donut --------------------------------------------------------
         segments = donut_segments(matrix)
+        # The chart is a real PNG attached with a Content-ID. Inline SVG is not
+        # an option: Gmail strips <svg> and leaves its text nodes loose on the
+        # page. If the image could not be built, the share bars alone still
+        # carry the whole breakdown.
+        chart_cell = ''
+        if has_chart:
+            chart_cell = f'''
+        <td width="240" valign="middle" align="center" style="padding-right:20px;">
+          <img src="cid:donutchart" width="210" height="210" alt="Time spent by project"
+               style="display:block;border:0;outline:none;text-decoration:none;">
+          <div style="font-size:20px;font-weight:800;color:#0f172a;margin-top:8px;">
+            {esc(fmt_hours(grand))}
+          </div>
+          <div style="font-size:10px;font-weight:700;color:#64748b;letter-spacing:1px;">
+            TOTAL HOURS
+          </div>
+        </td>'''
         donut_html = f'''
     <table width="100%" cellpadding="0" cellspacing="0">
-      <tr>
-        <td width="230" valign="middle" align="center" style="padding-right:18px;">
-          {donut_svg(segments, grand)}
-        </td>
+      <tr>{chart_cell}
         <td valign="middle">
           <table width="100%" cellpadding="0" cellspacing="0">{share_bar_rows(segments, grand)}</table>
         </td>
@@ -547,17 +577,49 @@ def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime) -> 
 
 # -- Email -------------------------------------------------------------------
 
-def send_email(html_body: str, subject: str, cfg: dict) -> None:
-    msg = MIMEMultipart('alternative')
+def _parse_addresses(raw) -> list:
+    """Split a recipient string on commas, semicolons OR whitespace/newlines.
+
+    GitHub secrets are frequently pasted one address per line. A raw newline
+    inside a To/Cc header makes Python 3.11 raise
+    HeaderWriteError: folded header contains newline
+    and the whole send fails after all the work is already done. Splitting on
+    whitespace too makes the script tolerant of however the secret is entered.
+    """
+    if not raw:
+        return []
+    return [a.strip() for a in re.split(r"[,;\s]+", str(raw)) if a.strip()]
+
+
+def send_email(html_body: str, subject: str, cfg: dict, chart_png=None) -> None:
+    # 'related' wraps the HTML plus any cid: images it references. Without it
+    # the <img src="cid:donutchart"> would render as a broken image.
+    msg = MIMEMultipart('related')
     msg['Subject'] = subject
     msg['From'] = cfg['from']
-    msg['To'] = cfg['to']
-    if cfg.get('cc'):
-        msg['Cc'] = cfg['cc']
-    msg.attach(MIMEText(html_body, 'html'))
 
-    recipients = [a.strip() for a in cfg['to'].split(',') if a.strip()]
-    recipients += [a.strip() for a in (cfg.get('cc') or '').split(',') if a.strip()]
+    to_list = _parse_addresses(cfg.get('to'))
+    cc_list = _parse_addresses(cfg.get('cc'))
+    if not to_list:
+        raise SystemExit('No recipients configured — check the EMAIL_TO secret.')
+
+    # Never assign the raw secret to a header: a newline in it makes Python
+    # refuse to write the message at all.
+    msg['To'] = ', '.join(to_list)
+    if cc_list:
+        msg['Cc'] = ', '.join(cc_list)
+
+    alternative = MIMEMultipart('alternative')
+    alternative.attach(MIMEText(html_body, 'html'))
+    msg.attach(alternative)
+
+    if chart_png:
+        image = MIMEImage(chart_png, _subtype='png')
+        image.add_header('Content-ID', '<donutchart>')
+        image.add_header('Content-Disposition', 'inline', filename='time-by-project.png')
+        msg.attach(image)
+
+    recipients = to_list + cc_list
 
     print(f'Sending email via Gmail SMTP to: {", ".join(recipients)}')
     with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
@@ -603,7 +665,9 @@ def main() -> None:
           f'{fmt_hours(matrix["grand_hours"])}h total')
 
     sent_on = datetime.now(IST)
-    html_body = build_email_html(matrix, year, month, sent_on)
+    chart_png = donut_png(donut_segments(matrix), matrix['grand_hours'])
+    print(f'Donut chart: {"built" if chart_png else "skipped"}')
+    html_body = build_email_html(matrix, year, month, sent_on, has_chart=bool(chart_png))
     subject = f'Monthly Ops Report - {month_label(year, month)}'
 
     send_email(html_body, subject, {
@@ -611,7 +675,7 @@ def main() -> None:
         'app_password': gmail_password,
         'to': email_to,
         'cc': email_cc,
-    })
+    }, chart_png=chart_png)
 
 
 if __name__ == '__main__':
