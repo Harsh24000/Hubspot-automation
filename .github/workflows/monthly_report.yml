@@ -25,7 +25,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install requests pillow
 
       - name: Run monthly report
         working-directory: scripts/monthly_report
