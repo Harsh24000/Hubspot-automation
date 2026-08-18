@@ -441,15 +441,11 @@ def share_bar_rows(segments: List[Tuple[str, float, str]], total: float) -> str:
     invisible. Fixing the bar keeps the layout identical while making that
     impossible.
     """
-    # Bar length is relative to the BIGGEST segment, not to the total, so the
-    # top project's bar fills the track. Scaling by share of total made every
-    # bar look stubby — the largest only reached 28% of the width.
-    largest = max((v for _, v, _ in segments), default=0)
-
     rows = ''
     for name, value, color in segments:
         pct = (value / total * 100) if total else 0
-        width = max(3, round(value / largest * 100)) if largest else 3
+        # Bar length is the share of the month, matching the percent column.
+        width = max(2, round(pct))
         rows += (
             f'<tr>'
             # nowrap on the CELL, not just the text — otherwise the browser is
@@ -595,18 +591,16 @@ def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime,
             width = max(2, round((value / top_resource_hours * 100) if top_resource_hours else 0))
             resource_rows += (
                 f'<tr>'
-                # Numbers before the bar, same reason as the donut legend: a
-                # width:100% bar in the middle pushes them off the right edge.
-                f'<td style="padding:7px 12px 7px 0;font-size:13px;'
+                f'<td style="padding:7px 12px 7px 0;white-space:nowrap;font-size:13px;'
                 f'color:#0f172a;font-weight:600;">{esc(resource)}</td>'
-                f'<td width="76" style="padding:7px 0;text-align:right;white-space:nowrap;'
-                f'font-size:13px;font-weight:700;color:#0f172a;">{esc(fmt_hours(value))}h</td>'
-                f'<td width="56" style="padding:7px 0 7px 10px;text-align:right;white-space:nowrap;'
-                f'font-size:12px;color:#64748b;">{pct_of_total:.1f}%</td>'
-                f'<td style="padding:7px 0 7px 14px;width:100%;min-width:60px;">'
+                f'<td style="padding:7px 0;width:100%;min-width:80px;">'
                 f'<div style="background:#eef1f5;border-radius:4px;height:10px;">'
                 f'<div style="width:{width}%;background:#2a78d6;height:10px;border-radius:4px;"></div>'
                 f'</div></td>'
+                f'<td width="76" style="padding:7px 0 7px 14px;text-align:right;white-space:nowrap;'
+                f'font-size:13px;font-weight:700;color:#0f172a;">{esc(fmt_hours(value))}h</td>'
+                f'<td width="52" style="padding:7px 0 7px 10px;text-align:right;white-space:nowrap;'
+                f'font-size:12px;color:#64748b;">{pct_of_total:.1f}%</td>'
                 f'</tr>'
             )
 
@@ -755,7 +749,8 @@ def main() -> None:
 
     sent_on = datetime.now(IST)
     # The ring shows every project; the legend names only the top few.
-    chart = chart_segments(matrix)
+    # The donut draws exactly what the legend lists: top 5 + Other.
+    chart = donut_segments(matrix)
     chart_png = donut_png(chart, matrix['grand_hours'])
     if chart_png:
         preview = ', '.join(f'{n} {c}' for n, _v, c in chart[:6])
