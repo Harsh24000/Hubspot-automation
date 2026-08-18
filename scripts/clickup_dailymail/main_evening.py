@@ -6,6 +6,7 @@ then emails per-person planned vs actual with any unplanned tasks that came up.
 
 import json
 import os
+import re
 import smtplib
 import sys
 from collections import defaultdict
@@ -176,21 +177,37 @@ def build_report(client: ClickUpClient, snapshot: dict, time_entries: List[dict]
 
 # ── Email ─────────────────────────────────────────────────────────────────────
 
+def _parse_addresses(raw) -> list:
+    """Split a recipient string on commas, semicolons OR whitespace/newlines.
+
+    GitHub secrets are frequently pasted one address per line. A raw newline
+    inside a To/Cc header makes Python 3.11 raise
+    HeaderWriteError: folded header contains newline
+    and the whole send fails after all the work is already done. Splitting on
+    whitespace too makes the script tolerant of however the secret is entered.
+    """
+    if not raw:
+        return []
+    return [a.strip() for a in re.split(r"[,;\s]+", str(raw)) if a.strip()]
+
+
 def send_email(html_content: str, subject: str, cfg: dict) -> None:
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = cfg["from"]
-    msg["To"] = cfg["to"]
-    if cfg.get("cc"):
-        msg["Cc"] = cfg["cc"]
+    to_list = _parse_addresses(cfg.get("to"))
+    cc_list = _parse_addresses(cfg.get("cc"))
+    if not to_list:
+        raise SystemExit("No recipients configured — check the EMAIL_TO secret.")
+
+    # Join with ", " ourselves. Never assign the raw secret to a header: if it
+    # contains a newline, Python refuses to write the message at all.
+    msg["To"] = ", ".join(to_list)
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
 
     msg.attach(MIMEText(html_content, "html"))
 
-    # cfg["to"] / cfg["cc"] may be a single address or a comma-separated list —
-    # split into a real list so every address actually gets the email, not
-    # just the first one.
-    to_list = [addr.strip() for addr in cfg["to"].split(",") if addr.strip()]
-    cc_list = [addr.strip() for addr in cfg.get("cc", "").split(",") if addr.strip()]
     recipients = to_list + cc_list
 
     print(f"Sending email via Gmail SMTP to: {', '.join(recipients)}")
