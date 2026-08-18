@@ -109,7 +109,7 @@ def _planned_row_html(task: dict) -> str:
     </tr>"""
 
 
-def _unplanned_row_html(task: dict) -> str:
+def _unplanned_row_html(task: dict, have_snapshot: bool = True) -> str:
     module = task.get("product_module", "N/A") or "N/A"
     col = _module_color(module)
     task_url = task.get("task_url", "#")
@@ -151,7 +151,7 @@ def _unplanned_row_html(task: dict) -> str:
                         <td>
                           <span style="font-size:11px;font-weight:600;font-family:Arial,sans-serif;
                                         background:#FFF7ED;color:#EA580C;padding:3px 10px;
-                                        border-radius:12px;border:1px solid #FED7AA;">&#9889; Unplanned</span>
+                                        border-radius:12px;border:1px solid #FED7AA;">{"&#9889; Unplanned" if have_snapshot else "&#9203; Logged"}</span>
                         </td>
                       </tr>
                     </table>
@@ -193,7 +193,7 @@ def _fmt_hours_from_ms(ms: int) -> str:
     return f"{hours:.1f}h"
 
 
-def _person_section_html(name: str, data: dict) -> str:
+def _person_section_html(name: str, data: dict, have_snapshot: bool = True) -> str:
     avatar = _avatar_html(name, data.get("avatar"))
     planned = data.get("planned", [])
     unplanned = data.get("unplanned", [])
@@ -208,8 +208,9 @@ def _person_section_html(name: str, data: dict) -> str:
 
     unplanned_rows = ""
     if unplanned:
-        unplanned_rows = _section_header("Unplanned", len(unplanned), "#EA580C")
-        unplanned_rows += "".join(_unplanned_row_html(t) for t in unplanned)
+        unplanned_rows = _section_header(
+            "Unplanned" if have_snapshot else "Logged Today", len(unplanned), "#EA580C")
+        unplanned_rows += "".join(_unplanned_row_html(t, have_snapshot) for t in unplanned)
 
     return f"""
     <table cellpadding="0" cellspacing="0" border="0" width="100%"
@@ -224,10 +225,7 @@ def _person_section_html(name: str, data: dict) -> str:
                 <p style="margin:0;font-family:Arial,sans-serif;font-size:16px;
                            font-weight:700;color:#1E293B;">{name}</p>
                 <p style="margin:3px 0 0;font-family:Arial,sans-serif;font-size:12px;color:#94A3B8;">
-                  {total} {task_word} &nbsp;·&nbsp;
-                  <span style="color:#6366F1;">{len(planned)} planned</span>
-                  &nbsp;·&nbsp;
-                  <span style="color:#EA580C;">{len(unplanned)} unplanned</span>
+                  {total} {task_word}{" &nbsp;·&nbsp; " + f'<span style="color:#6366F1;">{len(planned)} planned</span> &nbsp;·&nbsp; <span style="color:#EA580C;">{len(unplanned)} unplanned</span>' if have_snapshot else ""}
                 </p>
               </td>
               <td style="vertical-align:middle;text-align:right;white-space:nowrap;">
@@ -252,7 +250,8 @@ def _person_section_html(name: str, data: dict) -> str:
     </table>"""
 
 
-def generate_email_html(report: Dict[str, dict], report_date: date) -> str:
+def generate_email_html(report: Dict[str, dict], report_date: date,
+                        have_snapshot: bool = True) -> str:
     today_str = report_date.strftime("%A, %B %d %Y")
     day_label = report_date.strftime("%A").upper()
     total_people = len(report)
@@ -260,8 +259,17 @@ def generate_email_html(report: Dict[str, dict], report_date: date) -> str:
     total_unplanned = sum(len(d["unplanned"]) for d in report.values())
     total_logged_ms = sum(d.get("total_logged_ms", 0) for d in report.values())
 
+    no_plan_banner = "" if have_snapshot else (
+        '<table cellpadding="0" cellspacing="0" border="0" width="100%" '
+        'style="margin-bottom:18px;"><tr><td style="background:#FFF7ED;'
+        'border:1px solid #FED7AA;border-radius:12px;padding:12px 16px;">'
+        '<p style="margin:0;font-family:Arial,sans-serif;font-size:13px;color:#9A3412;">'
+        '<strong>No morning plan was recorded today.</strong> Showing time logged in '
+        'ClickUp only &mdash; work is not split into planned vs unplanned.</p>'
+        '</td></tr></table>')
+
     person_sections = "".join(
-        _person_section_html(name, data)
+        _person_section_html(name, data, have_snapshot)
         for name, data in sorted(report.items())
     )
 
@@ -321,7 +329,7 @@ def generate_email_html(report: Dict[str, dict], report_date: date) -> str:
                   <td style="padding-left:28px;">
                     <p style="margin:0;font-family:Arial,sans-serif;font-size:26px;font-weight:800;color:#EA580C;">{total_unplanned}</p>
                     <p style="margin:2px 0 0;font-family:Arial,sans-serif;font-size:11px;font-weight:600;
-                               letter-spacing:1px;color:#94A3B8;text-transform:uppercase;">Unplanned</p>
+                               letter-spacing:1px;color:#94A3B8;text-transform:uppercase;">{"Unplanned" if have_snapshot else "Tasks"}</p>
                   </td>
                   <td style="width:1px;background:#E2E8F0;">&nbsp;</td>
                   <td style="padding-left:28px;">
@@ -344,6 +352,7 @@ def generate_email_html(report: Dict[str, dict], report_date: date) -> str:
           <tr>
             <td style="background:#F8FAFC;border:1px solid #E2E8F0;border-top:none;
                         border-bottom:none;padding:24px 20px 8px;">
+              {no_plan_banner}
               {person_sections}
             </td>
           </tr>
