@@ -418,10 +418,15 @@ def share_bar_rows(segments: List[Tuple[str, float, str]], total: float) -> str:
     invisible. Fixing the bar keeps the layout identical while making that
     impossible.
     """
+    # Bar length is relative to the BIGGEST segment, not to the total, so the
+    # top project's bar fills the track. Scaling by share of total made every
+    # bar look stubby — the largest only reached 28% of the width.
+    largest = max((v for _, v, _ in segments), default=0)
+
     rows = ''
     for name, value, color in segments:
         pct = (value / total * 100) if total else 0
-        width = max(2, round(pct))
+        width = max(3, round(value / largest * 100)) if largest else 3
         rows += (
             f'<tr>'
             # nowrap on the CELL, not just the text — otherwise the browser is
@@ -719,8 +724,14 @@ def main() -> None:
 
     sent_on = datetime.now(IST)
     # The ring shows every project; the legend names only the top few.
-    chart_png = donut_png(chart_segments(matrix), matrix['grand_hours'])
-    print(f'Donut chart: {"built" if chart_png else "skipped"}')
+    chart = chart_segments(matrix)
+    chart_png = donut_png(chart, matrix['grand_hours'])
+    if chart_png:
+        preview = ', '.join(f'{n} {c}' for n, _v, c in chart[:6])
+        print(f'Donut chart: built — {len(chart)} slice(s), {len(chart_png):,} bytes')
+        print(f'  colours: {preview}{" ..." if len(chart) > 6 else ""}')
+    else:
+        print('Donut chart: skipped (Pillow unavailable)')
     html_body = build_email_html(matrix, year, month, sent_on, has_chart=bool(chart_png))
     subject = f'Monthly Ops Report - {month_label(year, month)}'
 
