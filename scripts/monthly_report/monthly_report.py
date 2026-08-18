@@ -67,6 +67,11 @@ UNSPECIFIED = 'Unspecified'
 # is why every segment also carries a visible label + value in the legend.
 SERIES_COLORS = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300']
 
+# The donut draws EVERY project. The legend beside it names only the biggest
+# few — every project is still listed with hours and share in the full
+# breakdown table underneath.
+LEGEND_LIMIT = 5
+
 
 # -- Period ------------------------------------------------------------------
 
@@ -336,18 +341,60 @@ def donut_segments(matrix: dict) -> List[Tuple[str, float, str]]:
     return [(name, hrs, palette[i]) for i, (name, hrs) in enumerate(ranked)]
 
 
-def donut_png(segments: List[Tuple[str, float, str]], total: float,
-              size: int = 420, thickness: int = 105, supersample: int = 3):
-    """Render the donut as a PNG, returned as raw bytes (or None).
+def _load_font(size: int, bold: bool = False):
+    """A real TrueType face if the runner has one, else Pillow's default."""
+    from PIL import ImageFont
+    candidates = [
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf' if bold
+        else '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+        '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf' if bold
+        else '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                pass
+    try:
+        return ImageFont.load_default(size=size)      # Pillow >= 10.1
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _spread_labels(positions: List[float], gap: float, top: float, bottom: float) -> List[float]:
+    """Push overlapping label rows apart while keeping their original order.
+
+    Slices sit at whatever angle their size dictates, so their natural label
+    positions bunch together wherever many small projects are adjacent. One
+    downward pass enforces the minimum gap, then an upward pass pulls the
+    stack back inside the canvas if it overflowed.
+    """
+    if not positions:
+        return []
+    out = list(positions)
+    out[0] = max(out[0], top)
+    for i in range(1, len(out)):
+        out[i] = max(out[i], out[i - 1] + gap)
+    if out[-1] > bottom:
+        out[-1] = bottom
+        for i in range(len(out) - 2, -1, -1):
+            out[i] = min(out[i], out[i + 1] - gap)
+    return out
+
+
+def donut_png(segments: List[Tuple[str, float, str]], total: float):
+    """Donut with a labelled leader line for EVERY project.
+
+    Returns PNG bytes (or None if Pillow is unavailable).
 
     It has to be a real image, not inline SVG: Gmail strips <svg> entirely,
-    which left the chart missing and its <text> labels dumped into the page as
-    stray words. A PNG attached with a Content-ID renders in Gmail, Outlook,
-    Apple Mail and every mobile client.
+    which left the chart missing and its <text> nodes dumped into the page as
+    stray words. A PNG attached with a Content-ID renders everywhere.
 
-    No text is drawn inside the image — the total is rendered as HTML beneath
-    it instead, so the output never depends on a font being installed on the
-    build runner.
+    The ring is drawn supersampled and downscaled so the arcs are smooth;
+    the text is drawn afterwards at final resolution so it stays crisp.
     """
     if not segments or total <= 0:
         return None
@@ -355,40 +402,99 @@ def donut_png(segments: List[Tuple[str, float, str]], total: float,
         from PIL import Image, ImageDraw
     except ImportError:
         print('  [warn] Pillow not installed — donut image skipped '
-              '(the share bars still carry the full breakdown).')
+              '(the top-5 legend and the full table still carry the numbers).')
         return None
 
-    canvas = size * supersample
-    ring = thickness * supersample
-    # With many projects each slice is only a few degrees wide, so a fixed
-    # 1.2-degree gap would eat the smallest ones entirely. Shrink it as the
-    # slice count grows.
-    if len(segments) <= 1:
-        gap_degrees = 0.0
-    elif len(segments) <= 8:
-        gap_degrees = 1.2
-    else:
-        gap_degrees = 0.5
+    name_font = _load_font(14)
+    pct_font = _load_font(14, bold=True)
 
-    image = Image.new('RGB', (canvas, canvas), '#ffffff')
-    draw = ImageDraw.Draw(image)
-    box = [0, 0, canvas - 1, canvas - 1]
+    # One line per label ('Project A   1.5%'). Two-line labels made the image
+    # ~40% taller for no extra information.
+    line_height = 24
+    top_margin = 18
+    side_text_width = 230
+    radius = 150
+    ring = 62
+    elbow = 26
 
-    # Track ring, so rounding gaps never show as white wedges.
-    draw.ellipse(box, fill='#eef1f5')
+    # Work out each slice's mid-angle and which side its label belongs on
+    # BEFORE sizing the canvas — the split is driven by slice sizes, not by
+    # count, so one side routinely gets far more labels than the other and the
+    # canvas has to be tall enough for the busier side.
+    gap_degrees = 0.0 if len(segments) <= 1 else (1.2 if len(segments) <= 8 else 0.5)
+    angle = -90.0
+    mid_angles = []
+    for _, value, _c in segments:
+        sweep = value / total * 360.0
+        mid_angles.append(angle + sweep / 2)
+        angle += sweep
+    right_count = sum(1 for a in mid_angles if math.cos(math.radians(a)) >= 0)
+    rows_per_side = max(right_count, len(mid_angles) - right_count, 1)
+
+    height = max(2 * radius + 70,
+                 rows_per_side * line_height + 2 * top_margin + 24)
+    width = 2 * (side_text_width + elbow + radius) + 40
+    cx, cy = width / 2, height / 2
+
+    image = Image.new('RGB', (width, height), '#ffffff')
+
+    # ── ring, supersampled then downscaled ──────────────────────────────
+    ss = 3
+    side = 2 * radius * ss
+    ring_img = Image.new('RGBA', (side, side), (255, 255, 255, 0))
+    ring_draw = ImageDraw.Draw(ring_img)
+    box = [0, 0, side - 1, side - 1]
+    ring_draw.ellipse(box, fill='#eef1f5')
 
     angle = -90.0
     for _, value, color in segments:
-        if value <= 0:
-            continue
         sweep = value / total * 360.0
-        draw.pieslice(box, angle + gap_degrees / 2, angle + sweep - gap_degrees / 2,
-                      fill=color)
+        ring_draw.pieslice(box, angle + gap_degrees / 2, angle + sweep - gap_degrees / 2,
+                           fill=color)
         angle += sweep
+    hole = ring * ss
+    ring_draw.ellipse([hole, hole, side - 1 - hole, side - 1 - hole], fill=(255, 255, 255, 255))
+    ring_img = ring_img.resize((2 * radius, 2 * radius), Image.LANCZOS)
+    image.paste(ring_img, (int(cx - radius), int(cy - radius)), ring_img)
 
-    draw.ellipse([ring, ring, canvas - 1 - ring, canvas - 1 - ring], fill='#ffffff')
+    draw = ImageDraw.Draw(image)
 
-    image = image.resize((size, size), Image.LANCZOS)
+    # ── labels, split left/right and spread so none collide ─────────────
+    right, left = [], []
+    for i, (name, value, color) in enumerate(segments):
+        rad = math.radians(mid_angles[i])
+        pct = value / total * 100
+        anchor_y = cy + radius * math.sin(rad)
+        entry = (anchor_y, i, name, pct, color, rad)
+        (right if math.cos(rad) >= 0 else left).append(entry)
+
+    for side_entries, is_right in ((right, True), (left, False)):
+        side_entries.sort(key=lambda e: e[0])
+        ys = _spread_labels([e[0] for e in side_entries], line_height,
+                            top_margin + 18, height - top_margin - 18)
+        for (anchor_y, _, name, pct, color, rad), label_y in zip(side_entries, ys):
+            x0 = cx + radius * math.cos(rad)
+            y0 = cy + radius * math.sin(rad)
+            x1 = cx + (radius + elbow) * math.cos(rad)
+            y1 = cy + (radius + elbow) * math.sin(rad)
+            x2 = (cx + radius + elbow + 14) if is_right else (cx - radius - elbow - 14)
+            draw.line([(x0, y0), (x1, y1)], fill='#c8d0da', width=1)
+            draw.line([(x1, y1), (x2, label_y)], fill='#c8d0da', width=1)
+
+            pct_text = f'{pct:.1f}%'
+            pct_w = draw.textlength(pct_text, font=pct_font)
+            name_w = draw.textlength(name, font=name_font)
+            baseline = label_y - 8
+            if is_right:
+                tx = x2 + 8
+                draw.text((tx, baseline), name, font=name_font, fill='#0f172a')
+                draw.text((tx + name_w + 9, baseline), pct_text, font=pct_font, fill='#64748b')
+            else:
+                tx = x2 - 8
+                draw.text((tx - pct_w, baseline), pct_text, font=pct_font, fill='#64748b')
+                draw.text((tx - pct_w - 9 - name_w, baseline), name, font=name_font,
+                          fill='#0f172a')
+
     buffer = BytesIO()
     image.save(buffer, format='PNG', optimize=True)
     return buffer.getvalue()
@@ -569,28 +675,49 @@ def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime,
         # an option: Gmail strips <svg> and leaves its text nodes loose on the
         # page. If the image could not be built, the share bars alone still
         # carry the whole breakdown.
-        # Donut on top, legend full-width underneath. Side by side, a legend
-        # with one row per project squeezes the name column until every label
-        # wraps onto two lines and the bars collapse to slivers.
-        chart_block = ''
+        # LEFT: the donut, which labels every project with its own percentage.
+        # RIGHT: only the top few projects, so that column stays readable.
+        # The chart image carries its own labels, so it needs real width — the
+        # email container is widened for this report accordingly.
+        top_segments = segments[:LEGEND_LIMIT]
+        remainder = len(segments) - len(top_segments)
+        remainder_note = ''
+        if remainder > 0:
+            remainder_hours = round(sum(v for _, v, _ in segments[LEGEND_LIMIT:]), 2)
+            remainder_pct = (remainder_hours / grand * 100) if grand else 0
+            remainder_note = (
+                f'<div style="font-size:11px;color:#94a3b8;margin-top:10px;">'
+                f'+ {remainder} more project{"s" if remainder != 1 else ""} '
+                f'&mdash; {esc(fmt_hours(remainder_hours))}h ({remainder_pct:.1f}%). '
+                f'All of them are in the chart and in the table below.</div>'
+            )
+
+        chart_cell = ''
         if has_chart:
-            chart_block = f'''
-    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:22px;">
-      <tr>
-        <td align="center">
-          <img src="cid:donutchart" width="240" height="240" alt="Time spent by project"
-               style="display:block;border:0;outline:none;text-decoration:none;">
-          <div style="font-size:22px;font-weight:800;color:#0f172a;margin-top:10px;">
+            chart_cell = f'''
+        <td valign="middle" align="center" style="padding-right:24px;">
+          <img src="cid:donutchart" alt="Time spent by project"
+               style="display:block;border:0;outline:none;text-decoration:none;
+                      width:100%;max-width:640px;height:auto;">
+          <div style="font-size:21px;font-weight:800;color:#0f172a;margin-top:4px;">
             {esc(fmt_hours(grand))}
           </div>
           <div style="font-size:10px;font-weight:700;color:#64748b;letter-spacing:1px;">
             TOTAL HOURS
           </div>
+        </td>'''
+        donut_html = f'''
+    <table width="100%" cellpadding="0" cellspacing="0">
+      <tr>{chart_cell}
+        <td width="300" valign="middle">
+          <div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;
+                      letter-spacing:1px;margin-bottom:8px;">Top {len(top_segments)} projects</div>
+          <table width="100%" cellpadding="0" cellspacing="0">{share_bar_rows(top_segments, grand)}</table>
+          {remainder_note}
         </td>
       </tr>
-    </table>'''
-        donut_html = f'''{chart_block}
-    <table width="100%" cellpadding="0" cellspacing="0">{share_bar_rows(segments, grand)}</table>'''
+    </table>
+    {all_projects_table(matrix)}'''
 
         # -- Resource totals ----------------------------------------------
         top_resource_hours = matrix['resource_hours'][resources[0]] if resources else 0
@@ -647,7 +774,7 @@ def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime,
 <html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:20px;background:#f1f5f9;font-family:Arial,Helvetica,sans-serif;">
-<table width="100%" cellpadding="0" cellspacing="0" style="max-width:760px;margin:0 auto;">
+<table width="100%" cellpadding="0" cellspacing="0" style="max-width:980px;margin:0 auto;">
 
   <tr><td style="border-radius:20px 20px 0 0;overflow:hidden;background:linear-gradient(135deg,#0f2744 0%,#1a56a0 100%);padding:36px 32px;">
     <div style="color:#dbeafe;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">Monthly Ops Report &middot; {esc(range_label)}</div>
