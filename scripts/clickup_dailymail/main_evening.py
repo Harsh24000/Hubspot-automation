@@ -51,16 +51,40 @@ def _format_duration(ms: int) -> str:
 
 # ── Core logic ────────────────────────────────────────────────────────────────
 
-def load_snapshot() -> dict:
+def load_snapshot() -> tuple:
+    """Return (snapshot, have_snapshot).
+
+    The morning plan is OPTIONAL. This report used to sys.exit(1) when the
+    snapshot was missing, which meant a morning run that sent nothing (nobody
+    posted an "est" comment) silently killed the evening report too. The two
+    are independent: the evening report's real job is "what time was logged
+    today", and ClickUp answers that on its own. Without a morning plan we
+    simply cannot label work planned vs unplanned, so the email says so and
+    reports the logged time flat.
+    """
+    empty = {"date": str(date.today()), "people": {}}
+
     if not os.path.exists(SNAPSHOT_PATH):
-        print("ERROR: morning_snapshot.json not found — morning script must run first.")
-        sys.exit(1)
-    with open(SNAPSHOT_PATH) as f:
-        data = json.load(f)
+        print("NOTE: morning_snapshot.json not found — the morning report did not "
+              "run or sent nothing today.")
+        print("      Continuing WITHOUT the planned/unplanned split; logged time "
+              "is still reported in full.")
+        return empty, False
+
+    try:
+        with open(SNAPSHOT_PATH) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"NOTE: morning_snapshot.json could not be read ({exc}) — "
+              "continuing without the morning plan.")
+        return empty, False
+
     if data.get("date") != str(date.today()):
-        print(f"ERROR: Snapshot is from {data.get('date')}, not today ({date.today()}).")
-        sys.exit(1)
-    return data
+        print(f"NOTE: snapshot is from {data.get('date')}, not today "
+              f"({date.today()}) — ignoring it and continuing without the morning plan.")
+        return empty, False
+
+    return data, True
 
 
 def _get_product_module(task: dict) -> str:
@@ -246,8 +270,12 @@ def main() -> None:
 
     print(f"=== ClickUp Evening Report — {date.today()} ===")
 
-    snapshot = load_snapshot()
-    print(f"Loaded morning snapshot: {sum(len(v) for v in snapshot['people'].values())} planned tasks across {len(snapshot['people'])} people")
+    snapshot, have_snapshot = load_snapshot()
+    if have_snapshot:
+        print(f"Loaded morning snapshot: {sum(len(v) for v in snapshot['people'].values())} "
+              f"planned tasks across {len(snapshot['people'])} people")
+    else:
+        print("Running in LOGGED-TIME-ONLY mode (no morning plan available).")
 
     client = ClickUpClient(api_token)
     start_ms, end_ms = _today_range_ms()
@@ -290,8 +318,10 @@ def main() -> None:
         print(f"  {user}: {len(data['planned'])} planned, {len(data['unplanned'])} unplanned")
 
     report_date = date.today()
-    html = generate_email_html(report, report_date)
+    html = generate_email_html(report, report_date, have_snapshot=have_snapshot)
     subject = f"Evening Report — {report_date.strftime('%A, %b %d')}"
+    if not have_snapshot:
+        subject += " (logged time only)"
 
     send_email(html, subject, {
         "from": gmail_from,
