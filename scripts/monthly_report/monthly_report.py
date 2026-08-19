@@ -47,6 +47,7 @@ import math
 import html
 import smtplib
 import calendar
+import colorsys
 from io import BytesIO
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -65,6 +66,7 @@ UNSPECIFIED = 'Unspecified'
 # normal-vision dE 19.6). Three of these sit under 3:1 contrast on white, which
 # is why every segment also carries a visible label + value in the legend.
 SERIES_COLORS = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300']
+
 OTHER_COLOR = '#8a8a85'
 MAX_DONUT_SEGMENTS = 6   # part-to-whole reads at a glance only up to ~6 slices
 
@@ -300,6 +302,38 @@ def build_matrix(person_task_ms: Dict[str, Dict[str, int]], resolve_module) -> d
 
 # -- Chart + chrome ----------------------------------------------------------
 
+def project_colors(count: int) -> List[str]:
+    """A distinct colour for every project.
+
+    The first six come from the validated categorical palette — those go to the
+    projects that dominate the month, and they are the ones the legend names.
+    Beyond that, hues are walked in golden-angle steps with the lightness tier
+    rotating each round, spreading any number of extra colours around the wheel
+    without two neighbours landing on the same shade.
+    """
+    if count <= len(SERIES_COLORS):
+        return SERIES_COLORS[:count]
+    colors = list(SERIES_COLORS)
+    golden_ratio = 0.618033988749895
+    tiers = [(0.60, 0.50), (0.48, 0.65), (0.70, 0.38), (0.38, 0.57)]
+    hue, index = 0.11, 0
+    while len(colors) < count:
+        hue = (hue + golden_ratio) % 1.0
+        saturation, lightness = tiers[index % len(tiers)]
+        red, green, blue = colorsys.hls_to_rgb(hue, lightness, saturation)
+        colors.append('#%02x%02x%02x' % (round(red * 255), round(green * 255), round(blue * 255)))
+        index += 1
+    return colors
+
+
+def chart_segments(matrix: dict) -> List[Tuple[str, float, str]]:
+    """EVERY project, one slice each — this is what the donut draws."""
+    project_hours = matrix['project_hours']
+    ranked = [(p, project_hours[p]) for p in matrix['projects'] if project_hours[p] > 0]
+    palette = project_colors(len(ranked))
+    return [(name, hrs, palette[i]) for i, (name, hrs) in enumerate(ranked)]
+
+
 def donut_segments(matrix: dict) -> List[Tuple[str, float, str]]:
     """Top projects by hours, tail folded into 'Other'. Never cycles hues."""
     projects = matrix['projects']
@@ -313,7 +347,8 @@ def donut_segments(matrix: dict) -> List[Tuple[str, float, str]]:
 
     segments = [(name, hrs, SERIES_COLORS[i]) for i, (name, hrs) in enumerate(head)]
     if tail:
-        segments.append((f'Other ({len(tail)} projects)', round(sum(h for _, h in tail), 2), OTHER_COLOR))
+        segments.append((f'Other ({len(tail)} projects)',
+                         round(sum(h for _, h in tail), 2), OTHER_COLOR))
     return segments
 
 
@@ -326,9 +361,9 @@ def donut_png(segments: List[Tuple[str, float, str]], total: float,
     stray words. A PNG attached with a Content-ID renders in Gmail, Outlook,
     Apple Mail and every mobile client.
 
-    No text is drawn inside the image — the total is rendered as HTML beneath
-    it instead, so the output never depends on a font being installed on the
-    build runner.
+    No text is drawn inside the image — the legend beside it carries every
+    name, hour figure and percentage, so the output never depends on a font
+    being installed on the build runner.
     """
     if not segments or total <= 0:
         return None
@@ -336,57 +371,109 @@ def donut_png(segments: List[Tuple[str, float, str]], total: float,
         from PIL import Image, ImageDraw
     except ImportError:
         print('  [warn] Pillow not installed — donut image skipped '
-              '(the share bars still carry the full breakdown).')
+              '(the legend still carries the full breakdown).')
         return None
 
     canvas = size * supersample
     ring = thickness * supersample
-    gap_degrees = 1.2 if len(segments) > 1 else 0.0
+    if len(segments) <= 1:
+        gap_degrees = 0.0
+    elif len(segments) <= 8:
+        gap_degrees = 1.2
+    else:
+        gap_degrees = 0.5
 
-    image = Image.new('RGB', (canvas, canvas), '#ffffff')
+    def rgb(hex_color: str):
+        """'#2a78d6' -> (42, 120, 214). Passed as a tuple rather than a string
+        so no Pillow build can mis-parse the colour."""
+        h = hex_color.lstrip('#')
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+    image = Image.new('RGB', (canvas, canvas), (255, 255, 255))
     draw = ImageDraw.Draw(image)
     box = [0, 0, canvas - 1, canvas - 1]
 
     # Track ring, so rounding gaps never show as white wedges.
-    draw.ellipse(box, fill='#eef1f5')
+    draw.ellipse(box, fill=(238, 241, 245))
 
     angle = -90.0
     for _, value, color in segments:
         if value <= 0:
             continue
         sweep = value / total * 360.0
-        draw.pieslice(box, angle + gap_degrees / 2, angle + sweep - gap_degrees / 2,
-                      fill=color)
+
+        # THE GREEN-DONUT BUG. A tiny project (0.5h of 880h is 0.2 degrees)
+        # is narrower than the separator gap, so `start + gap/2` lands AFTER
+        # `end - gap/2`. Pillow reads start > end as "sweep clockwise the long
+        # way round" and paints ~78% of the canvas in that project's colour,
+        # burying every slice drawn before it. Shrink the gap to fit the slice,
+        # and never let the end angle fall behind the start.
+        gap = min(gap_degrees, sweep * 0.5)
+        start = angle + gap / 2
+        end = angle + sweep - gap / 2
+        if end <= start:
+            end = start + 0.02          # hairline, but never a full circle
+
+        draw.pieslice(box, start, end, fill=rgb(color))
         angle += sweep
 
-    draw.ellipse([ring, ring, canvas - 1 - ring, canvas - 1 - ring], fill='#ffffff')
+    draw.ellipse([ring, ring, canvas - 1 - ring, canvas - 1 - ring], fill=(255, 255, 255))
 
     image = image.resize((size, size), Image.LANCZOS)
+
+    # Prove, server-side, what actually landed in the pixels. If this reports a
+    # single colour the fault is here; if it reports many but the email shows
+    # one, the fault is in the mail client rendering the image.
+    try:
+        sampled = image.convert('RGB').getcolors(maxcolors=200000) or []
+        sampled = [c for c in sampled
+                   if c[1] not in ((255, 255, 255), (238, 241, 245))]
+        sampled.sort(reverse=True)
+        summary = ', '.join('#%02x%02x%02x(%d)' % (c[1][0], c[1][1], c[1][2], c[0])
+                            for c in sampled[:6])
+        print(f'  chart pixels: {len(sampled)} distinct colour(s); top: {summary}')
+    except Exception as exc:
+        print(f'  [warn] could not sample chart pixels: {exc}')
+
     buffer = BytesIO()
-    image.save(buffer, format='PNG', optimize=True)
+    image.save(buffer, format='PNG')
     return buffer.getvalue()
 
 
 def share_bar_rows(segments: List[Tuple[str, float, str]], total: float) -> str:
-    """Legend + share bars. Carries the full story on its own, so the chart
-    still reads if a mail client strips the inline SVG."""
+    """Donut legend: colour, name, hours, percent, then the bar.
+
+    Column order is name, bar, hours, percent.
+
+    The bar carries a FIXED width rather than width:100%. When it was elastic
+    it expanded to fill the row and pushed the hours and percent columns off
+    the right edge in narrower mail windows — the figures were in the HTML but
+    invisible. Fixing the bar keeps the layout identical while making that
+    impossible.
+    """
     rows = ''
     for name, value, color in segments:
         pct = (value / total * 100) if total else 0
+        # Bar length is the share of the month, matching the percent column.
         width = max(2, round(pct))
         rows += (
             f'<tr>'
-            f'<td style="padding:7px 10px 7px 0;white-space:nowrap;">'
-            f'<span style="display:inline-block;width:10px;height:10px;border-radius:3px;'
-            f'background:{color};margin-right:8px;"></span>'
+            # nowrap on the CELL, not just the text — otherwise the browser is
+            # free to break between the colour swatch and the label, dropping
+            # longer project names onto a second line.
+            f'<td style="padding:7px 18px 7px 0;white-space:nowrap;width:1%;">'
+            f'<span style="display:inline-block;width:11px;height:11px;border-radius:3px;'
+            f'background:{color};margin-right:9px;"></span>'
             f'<span style="font-size:13px;color:#0f172a;">{esc(name)}</span></td>'
-            f'<td style="padding:7px 0;width:100%;">'
+            # Elastic track: it takes the leftover width of the row so the bar
+            # runs the full span between the project name and the figures.
+            f'<td style="padding:7px 0;width:100%;min-width:90px;">'
             f'<div style="background:#eef1f5;border-radius:4px;height:10px;">'
             f'<div style="width:{width}%;background:{color};height:10px;border-radius:4px;"></div>'
             f'</div></td>'
-            f'<td style="padding:7px 0 7px 12px;white-space:nowrap;text-align:right;'
+            f'<td width="66" style="padding:7px 0 7px 12px;white-space:nowrap;text-align:right;'
             f'font-size:13px;color:#0f172a;font-weight:700;">{esc(fmt_hours(value))}h</td>'
-            f'<td style="padding:7px 0 7px 10px;white-space:nowrap;text-align:right;'
+            f'<td width="48" style="padding:7px 0 7px 8px;white-space:nowrap;text-align:right;'
             f'font-size:12px;color:#64748b;">{pct:.1f}%</td>'
             f'</tr>'
         )
@@ -480,7 +567,7 @@ def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime,
         )
 
         # -- Donut --------------------------------------------------------
-        segments = donut_segments(matrix)
+        segments = donut_segments(matrix)      # top 5 + Other, for the legend
         # The chart is a real PNG attached with a Content-ID. Inline SVG is not
         # an option: Gmail strips <svg> and leaves its text nodes loose on the
         # page. If the image could not be built, the share bars alone still
@@ -488,8 +575,8 @@ def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime,
         chart_cell = ''
         if has_chart:
             chart_cell = f'''
-        <td width="240" valign="middle" align="center" style="padding-right:20px;">
-          <img src="cid:donutchart" width="210" height="210" alt="Time spent by project"
+        <td width="216" valign="middle" align="center" style="padding-right:16px;">
+          <img src="cid:donutchart" width="200" height="200" alt="Time spent by project"
                style="display:block;border:0;outline:none;text-decoration:none;">
           <div style="font-size:20px;font-weight:800;color:#0f172a;margin-top:8px;">
             {esc(fmt_hours(grand))}
@@ -518,13 +605,13 @@ def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime,
                 f'<tr>'
                 f'<td style="padding:7px 12px 7px 0;white-space:nowrap;font-size:13px;'
                 f'color:#0f172a;font-weight:600;">{esc(resource)}</td>'
-                f'<td style="padding:7px 0;width:100%;">'
+                f'<td style="padding:7px 0;width:100%;min-width:80px;">'
                 f'<div style="background:#eef1f5;border-radius:4px;height:10px;">'
                 f'<div style="width:{width}%;background:#2a78d6;height:10px;border-radius:4px;"></div>'
                 f'</div></td>'
-                f'<td style="padding:7px 0 7px 12px;text-align:right;white-space:nowrap;'
+                f'<td width="76" style="padding:7px 0 7px 14px;text-align:right;white-space:nowrap;'
                 f'font-size:13px;font-weight:700;color:#0f172a;">{esc(fmt_hours(value))}h</td>'
-                f'<td style="padding:7px 0 7px 10px;text-align:right;white-space:nowrap;'
+                f'<td width="52" style="padding:7px 0 7px 10px;text-align:right;white-space:nowrap;'
                 f'font-size:12px;color:#64748b;">{pct_of_total:.1f}%</td>'
                 f'</tr>'
             )
@@ -614,10 +701,18 @@ def send_email(html_body: str, subject: str, cfg: dict, chart_png=None) -> None:
     msg.attach(alternative)
 
     if chart_png:
-        image = MIMEImage(chart_png, _subtype='png')
-        image.add_header('Content-ID', '<donutchart>')
-        image.add_header('Content-Disposition', 'inline', filename='time-by-project.png')
-        msg.attach(image)
+        inline = MIMEImage(chart_png, _subtype='png')
+        inline.add_header('Content-ID', '<donutchart>')
+        inline.add_header('Content-Disposition', 'inline', filename='time-by-project.png')
+        msg.attach(inline)
+
+        # Same bytes again as a normal attachment. Some clients recolour or fail
+        # to render inline CID images; the attached copy can always be opened to
+        # see the real chart.
+        download = MIMEImage(chart_png, _subtype='png')
+        download.add_header('Content-Disposition', 'attachment',
+                            filename='time-by-project.png')
+        msg.attach(download)
 
     recipients = to_list + cc_list
 
@@ -665,8 +760,17 @@ def main() -> None:
           f'{fmt_hours(matrix["grand_hours"])}h total')
 
     sent_on = datetime.now(IST)
-    chart_png = donut_png(donut_segments(matrix), matrix['grand_hours'])
-    print(f'Donut chart: {"built" if chart_png else "skipped"}')
+    # The ring shows every project; the legend names only the top few.
+    # The donut draws EVERY project, each with its own colour.
+    # The legend beside it still lists only the top 5 + Other — unchanged.
+    chart = chart_segments(matrix)
+    chart_png = donut_png(chart, matrix['grand_hours'])
+    if chart_png:
+        preview = ', '.join(f'{n} {c}' for n, _v, c in chart[:6])
+        print(f'Donut chart: built — {len(chart)} slice(s), {len(chart_png):,} bytes')
+        print(f'  colours: {preview}{" ..." if len(chart) > 6 else ""}')
+    else:
+        print('Donut chart: skipped (Pillow unavailable)')
     html_body = build_email_html(matrix, year, month, sent_on, has_chart=bool(chart_png))
     subject = f'Monthly Ops Report - {month_label(year, month)}'
 
