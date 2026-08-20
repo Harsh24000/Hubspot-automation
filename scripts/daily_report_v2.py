@@ -28,6 +28,11 @@ def pdf_safe(text):
 HUBSPOT_TOKEN      = os.environ['HUBSPOT_TOKEN']
 GMAIL_ADDRESS      = os.environ['GMAIL_ADDRESS']
 GMAIL_APP_PASSWORD = os.environ['GMAIL_APP_PASSWORD']
+# The report's name, used in the email subject, the HTML header, the PDF
+# header/footer and the PDF filename. Change it here only.
+REPORT_TITLE = "NirogGyan's Sales and Support Tickets"
+REPORT_FILE_SLUG = 'NirogGyan_Sales_and_Support_Tickets'
+
 # Recipients are hardcoded in RECIPIENTS near the bottom of this file. The
 # RECIPIENT_EMAIL secret is no longer read here — the workflow may still pass
 # it, and it is simply ignored.
@@ -865,7 +870,7 @@ def format_html(data, calendar_days, ai_briefing='', clickup_tickets=None):
 <table width="100%" cellpadding="0" cellspacing="0" style="max-width:720px;margin:0 auto;">
 
   <tr><td style="background:linear-gradient(135deg,#0f2744,#1a56a0);border-radius:12px 12px 0 0;padding:28px 32px;">
-    <div style="color:white;font-size:22px;font-weight:700;letter-spacing:-0.5px;">NirogGyan Daily Pulse</div>
+    <div style="color:white;font-size:22px;font-weight:700;letter-spacing:-0.5px;">{REPORT_TITLE}</div>
     <div style="color:rgba(255,255,255,0.65);font-size:13px;margin-top:4px;">{data["date"]} &nbsp;|&nbsp; Auto-generated report</div>
   </td></tr>
 
@@ -945,7 +950,7 @@ class PulsePDF(FPDF):
         self.set_font('Helvetica', 'B', 14)
         self.set_text_color(255, 255, 255)
         self.set_xy(12, 6)
-        self.cell(0, 10, 'NirogGyan Daily Pulse', new_x=XPos.RIGHT, new_y=YPos.TOP)
+        self.cell(0, 10, pdf_safe(REPORT_TITLE), new_x=XPos.RIGHT, new_y=YPos.TOP)
         self.set_font('Helvetica', '', 9)
         self.set_text_color(180, 200, 220)
         self.set_xy(12, 14)
@@ -955,7 +960,7 @@ class PulsePDF(FPDF):
         self.set_y(-12)
         self.set_font('Helvetica', 'I', 8)
         self.set_text_color(150, 150, 150)
-        self.cell(0, 8, pdf_safe(f'NirogGyan Daily Pulse - {_today_ist.strftime("%d %B %Y")}'), align='C')
+        self.cell(0, 8, pdf_safe(f'{REPORT_TITLE} - {_today_ist.strftime("%d %B %Y")}'), align='C')
 
     def section_title(self, title):
         self.ln(4)
@@ -1190,7 +1195,7 @@ def format_pdf(data, calendar_days, ai_briefing='', clickup_tickets=None):
 
 # ── Email ─────────────────────────────────────────────────────────────────────
 
-# Who receives the Daily Pulse. To add or remove someone, edit THIS LIST ONLY —
+# Who receives this report. To add or remove someone, edit THIS LIST ONLY —
 # it is the single place recipients are defined.
 RECIPIENTS = [
     'operations@niroggyan.com',
@@ -1212,7 +1217,7 @@ def send_email(subject, html_body, pdf_bytes, date_str):
     pdf_part = MIMEBase('application', 'pdf')
     pdf_part.set_payload(pdf_bytes)
     encoders.encode_base64(pdf_part)
-    filename = f'NirogGyan_Pulse_{date_str.replace(" ", "_")}.pdf'
+    filename = f'{REPORT_FILE_SLUG}_{date_str.replace(" ", "_")}.pdf'
     pdf_part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
     msg.attach(pdf_part)
 
@@ -1255,5 +1260,5 @@ if __name__ == '__main__':
     pdf  = format_pdf(data, calendar_days, ai_briefing=ai_briefing, clickup_tickets=clickup_tickets)
 
     print('Sending email...')
-    send_email(f"NirogGyan Daily Pulse - {date_str}", html, pdf, date_str)
+    send_email(f"{REPORT_TITLE} - {date_str}", html, pdf, date_str)
     print('Done. Email sent.')
