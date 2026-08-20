@@ -70,6 +70,56 @@ SERIES_COLORS = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300
 OTHER_COLOR = '#8a8a85'
 MAX_DONUT_SEGMENTS = 6   # part-to-whole reads at a glance only up to ~6 slices
 
+# Billing rate per hour, in rupees, keyed by lowercased ClickUp username.
+# A resource with NO rate here is left out of the report entirely — that is how
+# people who have left the team drop off (Akshar). Anyone excluded is named in
+# the run log, so it can never happen silently.
+RESOURCE_RATES = {
+    'sai ram': 198,
+    'pushpendra singh sikarwar': 234,
+    'umesh chandra dani': 391,
+    'ashok mehra': 357,
+    'vikas sharma': 130,
+}
+
+# Expected working hours in a month. Each resource's bar and percentage are
+# measured against this, and anything above it is flagged as overflow.
+MONTHLY_HOURS_BASELINE = 192
+
+
+def rate_for(resource: str):
+    """Hourly rate for a ClickUp username, or None if they have no rate.
+
+    Matches the full name first, then falls back to the first name, so
+    'Pushpendra Singh' and 'pushpendra singh sikarwar' both resolve.
+    """
+    key = ' '.join((resource or '').lower().split())
+    if key in RESOURCE_RATES:
+        return RESOURCE_RATES[key]
+    parts = key.split()
+    if parts:
+        for known, rate in RESOURCE_RATES.items():
+            if known.split()[0] == parts[0]:
+                return rate
+    return None
+
+
+def fmt_inr(amount) -> str:
+    """9767.34 -> '9,767'  ·  215000 -> '2,15,000' (Indian grouping)."""
+    if not amount:
+        return '-'
+    whole = f'{int(round(amount)):d}'
+    if len(whole) <= 3:
+        return whole
+    head, tail = whole[:-3], whole[-3:]
+    groups = []
+    while len(head) > 2:
+        groups.insert(0, head[-2:])
+        head = head[:-2]
+    if head:
+        groups.insert(0, head)
+    return ','.join(groups) + ',' + tail
+
 
 # -- Period ------------------------------------------------------------------
 
@@ -290,13 +340,26 @@ def build_matrix(person_task_ms: Dict[str, Dict[str, int]], resolve_module) -> d
     resources = sorted(resource_ms, key=lambda r: (-resource_ms[r], r.lower()))
     grand_ms = sum(resource_ms.values())
 
+    cell_hours = {p: {r: hours(cell_ms[p].get(r, 0)) for r in resources} for p in projects}
+    rates = {r: (rate_for(r) or 0) for r in resources}
+
+    # Cost = hours x that person's hourly rate, summed per cell / row / column.
+    cell_cost = {p: {r: cell_hours[p][r] * rates[r] for r in resources} for p in projects}
+    project_cost = {p: sum(cell_cost[p].values()) for p in projects}
+    resource_cost = {r: sum(cell_cost[p][r] for p in projects) for r in resources}
+
     return {
         'projects': projects,
         'resources': resources,
-        'cell_hours': {p: {r: hours(cell_ms[p].get(r, 0)) for r in resources} for p in projects},
+        'cell_hours': cell_hours,
         'project_hours': {p: hours(project_ms[p]) for p in projects},
         'resource_hours': {r: hours(resource_ms[r]) for r in resources},
         'grand_hours': hours(grand_ms),
+        'rates': rates,
+        'cell_cost': cell_cost,
+        'project_cost': project_cost,
+        'resource_cost': resource_cost,
+        'grand_cost': sum(resource_cost.values()),
     }
 
 
@@ -525,7 +588,10 @@ def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime,
                      f'border-bottom:1px solid #dbe4ef;white-space:nowrap;">'
                      f'{esc(resource)}</th>')
         head += ('<th style="text-align:right;padding:9px 10px;font-size:11px;color:#0f2744;'
-                 'border-bottom:1px solid #dbe4ef;background:#e3ecf8;">Total</th></tr>')
+                 'border-bottom:1px solid #dbe4ef;background:#e3ecf8;">Total</th>'
+                 '<th style="text-align:right;padding:9px 10px;font-size:11px;color:#0f2744;'
+                 'border-bottom:1px solid #dbe4ef;background:#dce8f7;white-space:nowrap;">'
+                 'Total Cost (&#8377;)</th></tr>')
 
         rows = ''
         for index, project in enumerate(projects, start=1):
@@ -537,14 +603,22 @@ def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime,
                      f'border-bottom:1px solid #f1f5f9;">{esc(project)}</td>')
             for resource in resources:
                 value = matrix['cell_hours'][project].get(resource, 0)
+                cost = matrix['cell_cost'][project].get(resource, 0)
                 color = '#0f172a' if value else '#cbd5e1'
+                # hours on top, that cell's cost in brackets underneath
+                cost_line = (f'<div style="font-size:11px;color:#64748b;margin-top:2px;">'
+                             f'(&#8377;{esc(fmt_inr(cost))})</div>') if value else ''
                 rows += (f'<td style="padding:8px 10px;font-size:13px;text-align:right;'
                          f'color:{color};border-bottom:1px solid #f1f5f9;">'
-                         f'{esc(fmt_hours(value))}</td>')
+                         f'{esc(fmt_hours(value))}{cost_line}</td>')
             rows += (f'<td style="padding:8px 10px;font-size:13px;text-align:right;'
                      f'font-weight:700;color:#0f2744;background:#f5f9ff;'
                      f'border-bottom:1px solid #f1f5f9;">'
-                     f'{esc(fmt_hours(matrix["project_hours"][project]))}</td></tr>')
+                     f'{esc(fmt_hours(matrix["project_hours"][project]))}</td>'
+                     f'<td style="padding:8px 10px;font-size:13px;text-align:right;'
+                     f'font-weight:700;color:#0f2744;background:#eef4fc;'
+                     f'border-bottom:1px solid #f1f5f9;white-space:nowrap;">'
+                     f'&#8377;{esc(fmt_inr(matrix["project_cost"][project]))}</td></tr>')
 
         total_row = ('<tr style="background:#eef4fc;">'
                      '<td style="padding:10px;"></td>'
@@ -553,9 +627,15 @@ def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime,
         for resource in resources:
             total_row += (f'<td style="padding:10px;font-size:13px;text-align:right;'
                           f'font-weight:800;color:#0f2744;">'
-                          f'{esc(fmt_hours(matrix["resource_hours"][resource]))}</td>')
+                          f'{esc(fmt_hours(matrix["resource_hours"][resource]))}'
+                          f'<div style="font-size:11px;font-weight:700;color:#475569;'
+                          f'margin-top:2px;">(&#8377;'
+                          f'{esc(fmt_inr(matrix["resource_cost"][resource]))})</div></td>')
         total_row += (f'<td style="padding:10px;font-size:13px;text-align:right;font-weight:800;'
-                      f'color:#fff;background:#1a56a0;">{esc(fmt_hours(grand))}</td></tr>')
+                      f'color:#fff;background:#1a56a0;">{esc(fmt_hours(grand))}</td>'
+                      f'<td style="padding:10px;font-size:13px;text-align:right;font-weight:800;'
+                      f'color:#fff;background:#0f2744;white-space:nowrap;">'
+                      f'&#8377;{esc(fmt_inr(matrix["grand_cost"]))}</td></tr>')
 
         matrix_html = (
             '<div style="overflow-x:auto;">'
@@ -563,7 +643,8 @@ def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime,
             'style="border:1px solid #dbe4ef;border-radius:8px;overflow:hidden;">'
             f'{head}{rows}{total_row}</table></div>'
             '<div style="font-size:11px;color:#94a3b8;margin-top:10px;">'
-            'All figures are time spent, in hours. &ldquo;-&rdquo; means no time logged.</div>'
+            'All figures are time spent, in hours. &ldquo;-&rdquo; means no time logged. '
+            'Cost in brackets = hours &times; that resource&rsquo;s hourly rate.</div>'
         )
 
         # -- Donut --------------------------------------------------------
@@ -595,32 +676,51 @@ def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime,
     </table>'''
 
         # -- Resource totals ----------------------------------------------
-        top_resource_hours = matrix['resource_hours'][resources[0]] if resources else 0
+        # Bars are measured against the monthly baseline, not against each other.
+        # The track represents whichever is larger: the baseline, or the highest
+        # actual figure — so an overflow has somewhere to be drawn. Hours up to
+        # the baseline are blue; anything beyond it is red.
+        baseline = MONTHLY_HOURS_BASELINE
+        highest = max(matrix['resource_hours'].values(), default=0)
+        scale = max(baseline, highest) or 1
         resource_rows = ''
         for resource in resources:
             value = matrix['resource_hours'][resource]
-            pct_of_total = (value / grand * 100) if grand else 0
-            width = max(2, round((value / top_resource_hours * 100) if top_resource_hours else 0))
+            pct_of_baseline = (value / baseline * 100) if baseline else 0
+            within = min(value, baseline)
+            over = max(0.0, round(value - baseline, 2))
+            blue_width = max(1, round(within / scale * 100))
+            red_width = round(over / scale * 100) if over else 0
+            over_note = (f'<div style="font-size:11px;color:#dc2626;font-weight:700;'
+                         f'margin-top:2px;">+{esc(fmt_hours(over))}h over</div>') if over else ''
+            pct_color = '#dc2626' if over else '#64748b'
             resource_rows += (
                 f'<tr>'
                 f'<td style="padding:7px 12px 7px 0;white-space:nowrap;font-size:13px;'
-                f'color:#0f172a;font-weight:600;">{esc(resource)}</td>'
-                f'<td style="padding:7px 0;width:100%;min-width:80px;">'
-                f'<div style="background:#eef1f5;border-radius:4px;height:10px;">'
-                f'<div style="width:{width}%;background:#2a78d6;height:10px;border-radius:4px;"></div>'
-                f'</div></td>'
+                f'color:#0f172a;font-weight:600;vertical-align:top;">{esc(resource)}'
+                f'<div style="font-size:11px;color:#64748b;font-weight:400;margin-top:2px;">'
+                f'&#8377;{esc(fmt_inr(matrix["resource_cost"][resource]))}</div></td>'
+                f'<td style="padding:7px 0;width:100%;min-width:80px;vertical-align:top;">'
+                f'<div style="background:#eef1f5;border-radius:4px;height:10px;'
+                f'font-size:0;line-height:0;">'
+                f'<div style="display:inline-block;width:{blue_width}%;background:#2a78d6;'
+                f'height:10px;border-radius:4px 0 0 4px;"></div>'
+                + (f'<div style="display:inline-block;width:{red_width}%;background:#dc2626;'
+                   f'height:10px;border-radius:0 4px 4px 0;"></div>' if red_width else '')
+                + f'</div></td>'
                 f'<td width="76" style="padding:7px 0 7px 14px;text-align:right;white-space:nowrap;'
-                f'font-size:13px;font-weight:700;color:#0f172a;">{esc(fmt_hours(value))}h</td>'
-                f'<td width="52" style="padding:7px 0 7px 10px;text-align:right;white-space:nowrap;'
-                f'font-size:12px;color:#64748b;">{pct_of_total:.1f}%</td>'
+                f'font-size:13px;font-weight:700;color:#0f172a;vertical-align:top;">'
+                f'{esc(fmt_hours(value))}h{over_note}</td>'
+                f'<td width="56" style="padding:7px 0 7px 10px;text-align:right;white-space:nowrap;'
+                f'font-size:12px;font-weight:700;color:{pct_color};vertical-align:top;">'
+                f'{pct_of_baseline:.1f}%</td>'
                 f'</tr>'
             )
 
-        avg = round(grand / len(resources), 2) if resources else 0
         stats = (f'<tr>{_stat_tile(fmt_hours(grand), "Total Hours")}'
                  f'{_stat_tile(str(len(resources)), "Resources")}'
                  f'{_stat_tile(str(len(projects)), "Projects")}'
-                 f'{_stat_tile(fmt_hours(avg), "Avg / Resource")}</tr>')
+                 f'{_stat_tile("₹" + fmt_inr(matrix["grand_cost"]), "Total Cost")}</tr>')
 
         body = f'''
   <tr><td style="background:#fff;padding:0;"><table width="100%" cellpadding="0" cellspacing="0">{stats}</table></td></tr>
@@ -639,7 +739,7 @@ def build_email_html(matrix: dict, year: int, month: int, sent_on: datetime,
 
   {_slab('&#128100; Hours by Resource', '#166534')}
   <tr><td style="background:#fff;padding:20px 32px 32px;border-radius:0 0 20px 20px;">
-    {_section_title('Total logged per person')}
+    {_section_title(f'Total logged per person — against a {MONTHLY_HOURS_BASELINE}h baseline')}
     <table width="100%" cellpadding="0" cellspacing="0">{resource_rows}</table>
   </td></tr>'''
 
@@ -746,6 +846,18 @@ def main() -> None:
         print(f'Auto-detected team ID: {team_id}')
 
     person_task_ms = fetch_time_by_person_task(client, team_id, start_ms, end_ms)
+
+    # Only resources with a configured hourly rate are reported. People who
+    # have left the team simply have no rate, so they drop out here — and are
+    # named in the log so this is never a silent omission.
+    unrated = {p: t for p, t in person_task_ms.items() if rate_for(p) is None}
+    if unrated:
+        for person, tasks in unrated.items():
+            dropped = hours(sum(tasks.values()))
+            print(f'  [skip] {person}: no hourly rate configured — '
+                  f'{fmt_hours(dropped)}h excluded from this report')
+        person_task_ms = {p: t for p, t in person_task_ms.items() if p not in unrated}
+
     if not person_task_ms:
         print('No time entries found for this month — nothing to report.')
 
