@@ -154,6 +154,48 @@ def _is_closed(task: dict) -> bool:
     return (task.get('status') or {}).get('type') == 'closed'
 
 
+def _is_milestone(task: dict) -> bool:
+    """True when the ClickUp task is of the Milestone task type.
+
+    ClickUp models Milestones as a custom task type: custom_item_id == 1.
+    Some payloads also carry an explicit 'milestone' flag, so both are checked.
+    """
+    if task.get('milestone') is True:
+        return True
+    try:
+        return int(task.get('custom_item_id')) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def build_resource_milestones(all_tasks: list, task_ms: Dict[str, int]) -> dict:
+    """resource -> {'completed': [names], 'in_progress': [(name, status)]}
+
+    Only tasks flagged as Milestones in ClickUp, and only those that saw
+    activity during the reporting week. A milestone with several assignees
+    appears under each of them.
+    """
+    start_ms, end_ms = _last_week_range_ms()
+    result: Dict[str, dict] = defaultdict(lambda: {'completed': [], 'in_progress': []})
+    seen = 0
+
+    for task in all_tasks:
+        if not _is_milestone(task):
+            continue
+        if not _touched_last_week(task, start_ms, end_ms, task_ms):
+            continue
+        seen += 1
+        name = task.get('name', 'Untitled')
+        status = (task.get('status', {}).get('status') or '').title()
+        bucket = 'completed' if _is_closed(task) else 'in_progress'
+        for person in _assignees(task):
+            result[person][bucket].append((name, status))
+
+    print(f'  Milestones: {seen} milestone task(s) active last week '
+          f'across {len(result)} resource(s)')
+    return result
+
+
 def _last_week_range_ms() -> tuple:
     """Monday 00:00 IST through Sunday 23:59:59 IST of the week before this run."""
     now_ist = datetime.now(IST)
@@ -436,7 +478,44 @@ def _section_title(label: str) -> str:
             f'letter-spacing:1.5px;margin-bottom:14px;">&#9632; {label}</div>')
 
 
-def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, report_date: date) -> str:
+def _milestone_block(milestones: dict) -> str:
+    """Completed / In Progress milestone lists for one resource."""
+    completed = milestones.get('completed', [])
+    in_progress = milestones.get('in_progress', [])
+    if not completed and not in_progress:
+        return ''
+
+    def rows(items, color, bg, border):
+        out = ''
+        for name, status in items:
+            badge = (f'<span style="display:inline-block;margin-left:8px;padding:1px 7px;'
+                     f'border-radius:8px;background:{bg};color:{color};font-size:10px;'
+                     f'font-weight:700;border:1px solid {border};">{status}</span>'
+                     ) if status else ''
+            out += (f'<div style="font-size:12px;color:#0f172a;padding:3px 0;">'
+                    f'&bull; {name}{badge}</div>')
+        return out
+
+    blocks = ''
+    if completed:
+        blocks += (f'<div style="font-size:11px;font-weight:700;color:#059669;'
+                   f'text-transform:uppercase;letter-spacing:0.5px;margin:10px 0 2px;">'
+                   f'&#10003; Completed ({len(completed)})</div>'
+                   f'{rows(completed, "#059669", "#ECFDF5", "#A7F3D0")}')
+    if in_progress:
+        blocks += (f'<div style="font-size:11px;font-weight:700;color:#B45309;'
+                   f'text-transform:uppercase;letter-spacing:0.5px;margin:10px 0 2px;">'
+                   f'&#9203; In Progress ({len(in_progress)})</div>'
+                   f'{rows(in_progress, "#B45309", "#FFFBEB", "#FDE68A")}')
+
+    return (f'<div style="border-top:1px solid #f1f5f9;margin-top:10px;padding-top:2px;">'
+            f'<div style="font-size:11px;font-weight:700;color:#64748b;'
+            f'text-transform:uppercase;letter-spacing:1px;">Milestones</div>'
+            f'{blocks}</div>')
+
+
+def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, report_date: date,
+                     milestones: dict = None) -> str:
     today_str = report_date.strftime('%A, %B %d %Y')
     week_label = _last_week_display()
 
@@ -483,6 +562,7 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
             <th style="text-align:right;padding:6px 10px;font-size:11px;color:#94a3b8;">Tracked Time</th></tr>
         {rows}
       </table>
+      {_milestone_block((milestones or {}).get(resource, {}))}
     </div>'''
     if not tracking_html:
         tracking_html = '<div style="color:#94a3b8;font-size:13px;">No time tracked last week.</div>'
@@ -630,6 +710,7 @@ def main() -> None:
     print('Applying strict last-week filter...')
     onboarding = build_onboarding(all_tasks, task_ms)
     resource_tracking = build_resource_tracking(client, all_tasks, person_task_ms)
+    milestones = build_resource_milestones(all_tasks, task_ms)
     support = build_customer_support(support_tickets, task_ms)
 
     if _TICKET_TYPE_FIELDS_SEEN:
@@ -644,7 +725,8 @@ def main() -> None:
           f'{len(support)} client(s) in support')
 
     report_date = datetime.now(IST).date()
-    html = build_email_html(onboarding, resource_tracking, support, report_date)
+    html = build_email_html(onboarding, resource_tracking, support, report_date,
+                            milestones=milestones)
     subject = f'Weekly Ops Report — {_last_week_display()}'
 
     send_email(html, subject, {
