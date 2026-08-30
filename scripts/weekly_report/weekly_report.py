@@ -344,7 +344,39 @@ def _flatten_task_ms(person_task_ms: Dict[str, Dict[str, int]]) -> Dict[str, int
 
 # ── Section builders ────────────────────────────────────────────────────────
 
-def build_onboarding(all_tasks: list, task_ms: Dict[str, int]) -> dict:
+def _fmt_days(days) -> str:
+    if days is None:
+        return '-'
+    days = int(days)
+    if days <= 0:
+        return 'Today'
+    return f'{days} day' + ('' if days == 1 else 's')
+
+
+def fetch_status_duration(client: ClickUpClient, task_id: str):
+    """Whole days the task has been sitting in its CURRENT status.
+
+    Uses ClickUp's time-in-status endpoint, which reports minutes in the
+    current status. Returns None when the call fails, so one bad task never
+    takes the whole section down.
+    """
+    try:
+        data = client.get_time_in_status(task_id)
+    except Exception as exc:
+        print(f'  [warn] time_in_status failed for {task_id}: {exc}')
+        return None
+    current = (data or {}).get('current_status') or {}
+    minutes = ((current.get('total_time') or {}).get('by_minute'))
+    if minutes is None:
+        return None
+    try:
+        return int(int(minutes) // (60 * 24))
+    except (TypeError, ValueError):
+        return None
+
+
+def build_onboarding(all_tasks: list, task_ms: Dict[str, int],
+                     client: ClickUpClient = None) -> dict:
     """Onboarding clients with activity last week, closed tasks excluded."""
     start_ms, end_ms = _last_week_range_ms()
     by_client = defaultdict(list)
@@ -375,8 +407,14 @@ def build_onboarding(all_tasks: list, task_ms: Dict[str, int]) -> dict:
         created_ms = [int(t.get('date_created', 0) or 0) for t in tasks if t.get('date_created')]
         duration_days = _days_since(min(created_ms)) if created_ms else 0
         last_activity_ms = max((int(t.get('date_updated', 0) or 0) for t in tasks), default=0)
+
+        # How long this client has sat in their current status — one extra API
+        # call per client, against the task whose status is being shown.
+        status_days = fetch_status_duration(client, most_recent['id']) if client else None
+
         result[client_name] = {
             'status': status,
+            'status_days': status_days,
             'duration_days': duration_days,
             'last_activity_ms': last_activity_ms,
         }
@@ -527,12 +565,14 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
             f'<td style="padding:10px 12px;font-size:12px;">'
             f'<span style="display:inline-block;padding:3px 10px;border-radius:10px;'
             f'background:#eff6ff;color:#1d4ed8;font-size:11px;font-weight:700;">{d["status"]}</span></td>'
-            f'<td style="padding:10px 12px;font-size:13px;color:#334155;">{d["duration_days"]} '
-            f'day{"s" if d["duration_days"] != 1 else ""}</td>'
+            f'<td style="padding:10px 12px;font-size:13px;color:#334155;white-space:nowrap;">'
+            f'{_fmt_days(d.get("status_days"))}</td>'
+            f'<td style="padding:10px 12px;font-size:13px;color:#334155;white-space:nowrap;">'
+            f'{_fmt_days(d["duration_days"])}</td>'
             f'<td style="padding:10px 12px;font-size:13px;color:#64748b;">{_relative_time(d["last_activity_ms"])}</td></tr>'
         )
     if not onboarding_rows:
-        onboarding_rows = ('<tr><td colspan="4" style="padding:12px;color:#94a3b8;font-size:13px;">'
+        onboarding_rows = ('<tr><td colspan="5" style="padding:12px;color:#94a3b8;font-size:13px;">'
                            'No onboarding activity last week.</td></tr>')
 
     # ── Section 2: Resource → Project Tracking ──
@@ -604,7 +644,8 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
       <tr style="background:#f5f3ff;">
         <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Client Name</th>
         <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Status</th>
-        <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Duration</th>
+        <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;white-space:nowrap;">Status Duration</th>
+        <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;white-space:nowrap;">Task Duration</th>
         <th style="text-align:left;padding:8px 12px;font-size:11px;color:#64748b;">Last Activity</th>
       </tr>
       {onboarding_rows}
@@ -708,7 +749,7 @@ def main() -> None:
           f'{len(person_task_ms)} people\n')
 
     print('Applying strict last-week filter...')
-    onboarding = build_onboarding(all_tasks, task_ms)
+    onboarding = build_onboarding(all_tasks, task_ms, client)
     resource_tracking = build_resource_tracking(client, all_tasks, person_task_ms)
     milestones = build_resource_milestones(all_tasks, task_ms)
     support = build_customer_support(support_tickets, task_ms)
