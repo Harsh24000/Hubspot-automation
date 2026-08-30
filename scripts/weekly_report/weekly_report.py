@@ -353,26 +353,57 @@ def _fmt_days(days) -> str:
     return f'{days} day' + ('' if days == 1 else 's')
 
 
-def fetch_status_duration(client: ClickUpClient, task_id: str):
-    """Whole days the task has been sitting in its CURRENT status.
+# Set once the time-in-status endpoint has proved unusable, so the report
+# stops hammering an API that will not answer and says so exactly once.
+_STATUS_API_STATE = {'usable': True, 'reason': '', 'logged_sample': False}
 
-    Uses ClickUp's time-in-status endpoint, which reports minutes in the
-    current status. Returns None when the call fails, so one bad task never
-    takes the whole section down.
+
+def fetch_status_duration(client: ClickUpClient, task_id: str):
+    """(days_in_current_status, is_exact) for a task.
+
+    Primary source is ClickUp's time-in-status endpoint. That endpoint is a
+    PAID-PLAN feature and is also missing if clickup_client.py has not been
+    updated, so it can fail for reasons that have nothing to do with the task.
+    When it does, fall back to "days since the task was last updated" and mark
+    the figure approximate rather than leaving the column blank.
     """
-    try:
-        data = client.get_time_in_status(task_id)
-    except Exception as exc:
-        print(f'  [warn] time_in_status failed for {task_id}: {exc}')
-        return None
-    current = (data or {}).get('current_status') or {}
-    minutes = ((current.get('total_time') or {}).get('by_minute'))
-    if minutes is None:
-        return None
-    try:
-        return int(int(minutes) // (60 * 24))
-    except (TypeError, ValueError):
-        return None
+    if client is None:
+        return None, False
+
+    if _STATUS_API_STATE['usable']:
+        try:
+            data = client.get_time_in_status(task_id)
+        except AttributeError:
+            _STATUS_API_STATE.update(
+                usable=False,
+                reason='clickup_client.py is out of date — it has no '
+                       'get_time_in_status(). Push the updated client file.')
+            data = None
+        except Exception as exc:
+            _STATUS_API_STATE.update(
+                usable=False,
+                reason=f'ClickUp rejected the time-in-status call ({exc}). '
+                       f'That endpoint needs a Business/Enterprise plan.')
+            data = None
+
+        if data:
+            current = (data or {}).get('current_status') or {}
+            minutes = (current.get('total_time') or {}).get('by_minute')
+            if minutes is not None:
+                try:
+                    return int(int(minutes) // (60 * 24)), True
+                except (TypeError, ValueError):
+                    pass
+            if not _STATUS_API_STATE['logged_sample']:
+                _STATUS_API_STATE['logged_sample'] = True
+                print(f'  [warn] time_in_status returned an unexpected shape for '
+                      f'{task_id}: {str(data)[:200]}')
+                _STATUS_API_STATE.update(
+                    usable=False,
+                    reason='time-in-status responded but without '
+                           'current_status.total_time.by_minute')
+
+    return None, False
 
 
 def build_onboarding(all_tasks: list, task_ms: Dict[str, int],
@@ -410,14 +441,25 @@ def build_onboarding(all_tasks: list, task_ms: Dict[str, int],
 
         # How long this client has sat in their current status — one extra API
         # call per client, against the task whose status is being shown.
-        status_days = fetch_status_duration(client, most_recent['id']) if client else None
+        status_days, exact = fetch_status_duration(client, most_recent['id'])
+        if status_days is None:
+            # Fallback: nothing has changed on the task since it was last
+            # touched, so days-since-update approximates time in status.
+            status_days = _days_since(int(most_recent.get('date_updated', 0) or 0))
+            exact = False
 
         result[client_name] = {
             'status': status,
             'status_days': status_days,
+            'status_exact': exact,
             'duration_days': duration_days,
             'last_activity_ms': last_activity_ms,
         }
+
+    if not _STATUS_API_STATE['usable']:
+        print(f'  [warn] Status Duration is approximate — {_STATUS_API_STATE["reason"]}')
+        print('         Falling back to days since the task was last updated.')
+
     return result
 
 
@@ -566,7 +608,7 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
             f'<span style="display:inline-block;padding:3px 10px;border-radius:10px;'
             f'background:#eff6ff;color:#1d4ed8;font-size:11px;font-weight:700;">{d["status"]}</span></td>'
             f'<td style="padding:10px 12px;font-size:13px;color:#334155;white-space:nowrap;">'
-            f'{_fmt_days(d.get("status_days"))}</td>'
+            f'{"" if d.get("status_exact") else "~"}{_fmt_days(d.get("status_days"))}</td>'
             f'<td style="padding:10px 12px;font-size:13px;color:#334155;white-space:nowrap;">'
             f'{_fmt_days(d["duration_days"])}</td>'
             f'<td style="padding:10px 12px;font-size:13px;color:#64748b;">{_relative_time(d["last_activity_ms"])}</td></tr>'
