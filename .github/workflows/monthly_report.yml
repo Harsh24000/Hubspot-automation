@@ -7,10 +7,10 @@ on:
         description: 'Month to report on, as YYYY-MM (leave blank for last month)'
         required: false
         default: ''
-  schedule:
-    # 03:30 UTC on the 1st of every month = 09:00 IST.
-    # Reports the calendar month that just ended (1 Sep -> August).
-    - cron: '30 3 1 * *'
+  # NO schedule block on purpose. This report is triggered externally by
+  # cron-job.org calling the GitHub API, exactly like the weekly report.
+  # Adding a `schedule:` here as well would fire the workflow twice and send
+  # the same email twice.
 
 jobs:
   send-monthly-report:
@@ -25,7 +25,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests pillow
+        run: pip install requests
 
       - name: Run monthly report
         working-directory: scripts/monthly_report
