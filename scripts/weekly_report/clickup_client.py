@@ -161,6 +161,15 @@ class ClickUpClient:
         data = self._get(f"task/{task_id}/comment")
         return data.get("comments", [])
 
+    def get_time_in_status(self, task_id: str) -> Dict:
+        """How long a task has spent in its current status.
+
+        ClickUp returns {'current_status': {'status', 'total_time': {'by_minute', 'since'}},
+        'status_history': [...]}. Used for the Onboarding section's
+        "Status Duration" column.
+        """
+        return self._get(f"task/{task_id}/time_in_status")
+
     # ── Time tracking ────────────────────────────────────────────────────────
 
     def get_time_entries(self, team_id: str, start_ms: int, end_ms: int, assignee_id: int = None) -> List[Dict]:
