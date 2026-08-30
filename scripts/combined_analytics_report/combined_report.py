@@ -135,7 +135,9 @@ def fetch_ga4(token, property_id):
 
 # ── HTML HELPERS ─────────────────────────────────────────────────────────────
 def fmt_seconds(s):
-    s = int(float(s))
+    # Clarity omits or nulls engagement fields when a period has no data, so
+    # this has to survive None as well as '' and '12.5'.
+    s = int(_num(s, 0))
     if s < 60: return f"{s}s"
     return f"{s // 60}m {s % 60}s"
 
@@ -261,8 +263,8 @@ def build_site_section(site_cfg, clarity, ga4_data):
     bot_ses       = int(_num(traffic.get("totalBotSessionCount"), 0))
     human_ses     = total_raw - bot_ses
     pages_per_ses = _num(traffic.get("pagesPerSessionPercentage"), 0)
-    avg_dur       = engage.get("totalTime", "0")
-    avg_active    = engage.get("activeTime", "0")
+    avg_dur       = _num(engage.get("totalTime"), 0)
+    avg_active    = _num(engage.get("activeTime"), 0)
     avg_scroll    = _num(scroll_d.get("averageScrollDepth"), 0)
 
     devices   = clarity.get("Device",       [])
@@ -272,44 +274,46 @@ def build_site_section(site_cfg, clarity, ga4_data):
     pages     = clarity.get("PopularPages", [])
 
     def hpct(metric):
-        sub = int(metric.get("subTotal", 0))
+        sub = int(_num(metric.get("subTotal"), 0))
         return f"{sub / human_ses * 100:.1f}%" if human_ses > 0 else "0.0%"
 
     # ── Parse GA4 ──
     ov = (ga4_data.get("overview") or {}).get("rows", [])
-    ga4_users = ov[0]["metricValues"][0]["value"] if ov else "—"
+    ga4_users = _gv(ov[0], "metricValues", 0, "—") if ov else "—"
 
     nvr_rows = (ga4_data.get("new_vs_returning") or {}).get("rows", [])
     new_ses = ret_ses = new_usr = ret_usr = 0
     for row in nvr_rows:
-        lbl = row["dimensionValues"][0]["value"]
-        s   = int(row["metricValues"][0]["value"])
-        u   = int(row["metricValues"][1]["value"])
+        lbl = _gv(row, "dimensionValues", 0)
+        s   = int(_num(_gv(row, "metricValues", 0), 0))
+        u   = int(_num(_gv(row, "metricValues", 1), 0))
         if lbl == "new":         new_ses, new_usr = s, u
         elif lbl == "returning": ret_ses, ret_usr = s, u
 
     region_rows = (ga4_data.get("region") or {}).get("rows", [])
 
     # ── Derived ──
-    pc_ses  = next((int(d["sessionsCount"]) for d in devices if d["name"] == "PC"),     0)
-    mob_ses = next((int(d["sessionsCount"]) for d in devices if d["name"] == "Mobile"), 0)
+    pc_ses  = next((int(_num(d.get("sessionsCount"), 0))
+                    for d in devices if d.get("name") == "PC"),     0)
+    mob_ses = next((int(_num(d.get("sessionsCount"), 0))
+                    for d in devices if d.get("name") == "Mobile"), 0)
 
     clean_pages = []
     for p in pages[:7]:
-        url = p.get("url", "")
+        url = p.get("url") or ""          # key can be present-but-null
         if base_url:
             url = url.replace(base_url, "").replace(base_url.replace("www.", ""), "")
         url = url.replace("http://localhost:3000", "[local]")
-        clean_pages.append((url or "/", int(p.get("visitsCount", 0))))
+        clean_pages.append((url or "/", int(_num(p.get("visitsCount"), 0))))
 
     clean_refs = []
     for r in referrers[:6]:
         name = (r.get("name") or "Direct").replace("https://","").replace("http://","").rstrip("/")
-        clean_refs.append((name, int(r.get("sessionsCount", 0))))
+        clean_refs.append((name, int(_num(r.get("sessionsCount"), 0))))
 
     max_page    = max((v for _, v in clean_pages), default=1)
     max_ref     = max((v for _, v in clean_refs),  default=1)
-    max_country = max((int(c.get("sessionsCount",0)) for c in countries), default=1)
+    max_country = max((int(_num(c.get("sessionsCount"), 0)) for c in countries), default=1)
 
     # ── KPI cards ──
     kpi_row = "".join([
@@ -343,7 +347,7 @@ def build_site_section(site_cfg, clarity, ga4_data):
     # ── Bar charts ──
     pages_html   = "".join(_bar_row(u, v, max_page,    accent)    for u, v in clean_pages)
     refs_html    = "".join(_bar_row(n, v, max_ref,     "#7C3AED") for n, v in clean_refs)
-    country_html = "".join(_bar_row(c.get("name","—"), int(c.get("sessionsCount",0)),
+    country_html = "".join(_bar_row(c.get("name") or "—", int(_num(c.get("sessionsCount"), 0)),
                                     max_country, "#059669") for c in countries[:7])
 
     # ── Browser pills ──
@@ -358,9 +362,9 @@ def build_site_section(site_cfg, clarity, ga4_data):
     region_html = "".join(
         f'<tr style="background:{"#F9FAFB" if i % 2 == 0 else "#FFF"};">'
         f'<td style="padding:7px 12px;font-size:12px;color:#4B5563;">'
-        f'{row["dimensionValues"][0]["value"]} / {row["dimensionValues"][1]["value"]}</td>'
+        f'{_gv(row, "dimensionValues", 0, "—")} / {_gv(row, "dimensionValues", 1, "—")}</td>'
         f'<td style="padding:7px 12px;font-size:12px;font-weight:700;color:#111827;text-align:right;">'
-        f'{row["metricValues"][0]["value"]}</td></tr>'
+        f'{_gv(row, "metricValues", 0, "0")}</td></tr>'
         for i, row in enumerate(region_rows[:8])
     )
 
@@ -474,6 +478,18 @@ def _num(value, default=0):
         return float(value)
     except (TypeError, ValueError):
         return default
+def _gv(row, key, idx, default=""):
+    """Safe accessor for one value inside a GA4 row.
+
+    GA4 rows are row['dimensionValues'][i]['value'] / row['metricValues'][i]['value'].
+    When the API 403s or returns a partial row, any link in that chain can be
+    missing, so every read goes through here instead of raw indexing.
+    """
+    try:
+        value = (row.get(key) or [])[idx].get("value", default)
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return default
+    return default if value in (None, "") else value
 
 
 def build_email(niroggyan_clarity, niroggyan_ga4, brochure_clarity, brochure_ga4):
