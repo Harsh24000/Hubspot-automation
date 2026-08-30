@@ -231,6 +231,22 @@ def _sh(title, color="#1D4ED8"):
     )
 
 
+def _num(value, default=0):
+    """Coerce a Clarity/GA4 field to a number, tolerating null and ''.
+
+    dict.get(key, default) only returns the default when the key is ABSENT.
+    Clarity sends the key with a null value when a metric has no data for the
+    period, so .get('pagesPerSessionPercentage', 0) returns None and float(None)
+    raises TypeError — which crashed the whole report over one empty metric.
+    """
+    if value is None or value == '':
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def build_email(clarity, ga4_data):
     end   = datetime.now()
     start = end - timedelta(days=NUM_DAYS)
@@ -245,13 +261,13 @@ def build_email(clarity, ga4_data):
     qback      = (clarity.get("QuickbackClick") or [{}])[0]
     exc_sc     = (clarity.get("ExcessiveScroll")or [{}])[0]
 
-    total_raw      = int(traffic.get("totalSessionCount", 0))
-    bot_ses        = int(traffic.get("totalBotSessionCount", 0))
+    total_raw      = int(_num(traffic.get("totalSessionCount"), 0))
+    bot_ses        = int(_num(traffic.get("totalBotSessionCount"), 0))
     human_ses      = total_raw - bot_ses
-    pages_per_ses  = float(traffic.get("pagesPerSessionPercentage", 0))
+    pages_per_ses  = _num(traffic.get("pagesPerSessionPercentage"), 0)
     avg_dur        = engage.get("totalTime", "0")
     avg_active     = engage.get("activeTime", "0")
-    avg_scroll     = float(scroll_d.get("averageScrollDepth", 0))
+    avg_scroll     = _num(scroll_d.get("averageScrollDepth"), 0)
 
     devices   = clarity.get("Device",      [])
     browsers  = clarity.get("Browser",     [])
@@ -264,10 +280,10 @@ def build_email(clarity, ga4_data):
         return f"{sub / human_ses * 100:.1f}%" if human_ses > 0 else "0.0%"
 
     # ── Parse GA4 ──
-    ov = ga4_data["overview"].get("rows", [])
+    ov = (ga4_data.get("overview") or {}).get("rows", [])
     ga4_users = ov[0]["metricValues"][0]["value"] if ov else "—"
 
-    nvr_rows = ga4_data["new_vs_returning"].get("rows", [])
+    nvr_rows = (ga4_data.get("new_vs_returning") or {}).get("rows", [])
     new_ses = ret_ses = new_usr = ret_usr = 0
     for row in nvr_rows:
         lbl = row["dimensionValues"][0]["value"]
@@ -276,7 +292,7 @@ def build_email(clarity, ga4_data):
         if lbl == "new":         new_ses, new_usr = s, u
         elif lbl == "returning": ret_ses, ret_usr = s, u
 
-    region_rows = ga4_data["region"].get("rows", [])
+    region_rows = (ga4_data.get("region") or {}).get("rows", [])
 
     # ── Derived ──
     pc_ses  = next((int(d["sessionsCount"]) for d in devices if d["name"] == "PC"),     0)
