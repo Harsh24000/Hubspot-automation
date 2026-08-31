@@ -14,6 +14,7 @@ import json
 import math
 import time
 import urllib.request
+import urllib.error
 import urllib.parse
 import base64
 from datetime import datetime, timedelta
@@ -34,19 +35,116 @@ NUM_DAYS = 3   # Clarity max is 3; matches how often this is scheduled to run
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# ── RESILIENCE HELPERS ───────────────────────────────────────────────────────
+# Clarity's Live Insights API allows only a small number of calls per project
+# per day. Manual workflow re-runs burn that budget fast, and once it is gone
+# every call answers 429 until the quota resets. That used to abort the whole
+# report with a traceback; now it degrades to "no Clarity data this run".
+CLARITY_MAX_ATTEMPTS = 3
+CLARITY_BACKOFF_SECONDS = 15
+
+
+def _retry_after_seconds(err, attempt):
+    """Honour a Retry-After header when Clarity sends one, else back off."""
+    header = None
+    try:
+        header = (err.headers or {}).get('Retry-After')
+    except AttributeError:
+        pass
+    try:
+        return max(1, min(120, int(float(header))))
+    except (TypeError, ValueError):
+        return CLARITY_BACKOFF_SECONDS * attempt
+
+
+def _clarity_request(url, label):
+    """Return Clarity's parsed metrics, or None if Clarity will not serve us.
+
+    None means "no data available this run" — the caller keeps going and the
+    email carries a notice, instead of the workflow failing red.
+    """
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {CLARITY_TOKEN}"})
+
+    for attempt in range(1, CLARITY_MAX_ATTEMPTS + 1):
+        try:
+            raw = urllib.request.urlopen(req, timeout=60).read()
+        except urllib.error.HTTPError as err:
+            if err.code == 429:
+                if attempt == CLARITY_MAX_ATTEMPTS:
+                    print(f"  {label}: Clarity rate limit (429) still in force after "
+                          f"{attempt} attempts — continuing without Clarity data.")
+                    print("  Clarity allows only a few Live Insights calls per project "
+                          "per day; re-runs share that budget and it resets on its own.")
+                    return None
+                wait = _retry_after_seconds(err, attempt)
+                print(f"  {label}: Clarity rate limited (429) — retrying in {wait}s "
+                      f"(attempt {attempt}/{CLARITY_MAX_ATTEMPTS})")
+                time.sleep(wait)
+                continue
+            print(f"  {label}: Clarity HTTP {err.code} {err.reason} — "
+                  f"continuing without Clarity data.")
+            return None
+        except (urllib.error.URLError, TimeoutError, OSError) as err:
+            if attempt == CLARITY_MAX_ATTEMPTS:
+                print(f"  {label}: Clarity unreachable ({err}) — "
+                      f"continuing without Clarity data.")
+                return None
+            time.sleep(CLARITY_BACKOFF_SECONDS * attempt)
+            continue
+
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            print(f"  {label}: Clarity returned a non-JSON body — "
+                  f"continuing without Clarity data.")
+            return None
+
+        result = {}
+        for item in data or []:
+            if isinstance(item, dict) and item.get("metricName"):
+                result[item["metricName"]] = item.get("information") or []
+        return result
+
+    return None
+
+
+def _ga4_has_rows(ga4_data):
+    """True when at least one GA4 query came back with data."""
+    for key in ("overview", "new_vs_returning", "region"):
+        if ((ga4_data or {}).get(key) or {}).get("rows"):
+            return True
+    return False
+
+
+_BODY_TAG = '<body style="margin:0;padding:0;background:#E8EDF5;'
+
+
+def _with_notice(html, message):
+    """Put a warning strip at the top of the email body."""
+    if not message:
+        return html
+    strip = (
+        '<table width="100%" cellpadding="0" cellspacing="0" style="background:#FEF3C7;">'
+        '<tr><td style="padding:12px 18px;font-size:13px;line-height:1.5;color:#92400E;'
+        "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;"
+        'border-bottom:2px solid #F59E0B;">'
+        f'<strong>Heads up —</strong> {message}</td></tr></table>'
+    )
+    marker = html.find(_BODY_TAG)
+    if marker == -1:
+        return strip + html
+    insert_at = html.find('>', marker) + 1
+    return html[:insert_at] + strip + html[insert_at:]
+
+
 # ── CLARITY ──────────────────────────────────────────────────────────────────
 def fetch_clarity():
+    """Clarity metrics, or None when Clarity is rate limited / unavailable."""
     url = (
         f"https://www.clarity.ms/export-data/api/v1/project-live-insights"
         f"?projectId={CLARITY_PROJECT_ID}&numOfDays={NUM_DAYS}"
     )
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {CLARITY_TOKEN}"})
-    data = json.loads(urllib.request.urlopen(req).read())
-
-    result = {}
-    for item in data:
-        result[item["metricName"]] = item.get("information", [])
-    return result
+    return _clarity_request(url, "Niro Health")
 
 
 # ── GA4 ──────────────────────────────────────────────────────────────────────
@@ -543,11 +641,33 @@ def main():
     print("Fetching GA4 data...")
     ga4_data = fetch_ga4()
 
+    have_clarity = clarity is not None
+    have_ga4 = _ga4_has_rows(ga4_data)
+
+    # An email of all zeros reads like the traffic collapsed. If BOTH sources
+    # came back empty there is nothing worth reporting, so skip the send and
+    # finish green rather than mailing a misleading report.
+    if not have_clarity and not have_ga4:
+        print("\nNeither Clarity nor GA4 returned data — no email sent.")
+        print("  Clarity: rate limited or unavailable (see messages above)")
+        print("  GA4:     no rows — check the service account still has access")
+        print("Nothing to report; exiting cleanly so this run is not flagged as failed.")
+        return
+
+    notice = ""
+    if not have_clarity:
+        notice = ("Microsoft Clarity returned no data for this period (API rate "
+                  "limit), so the behaviour metrics below are blank. The Google "
+                  "Analytics figures are unaffected.")
+    elif not have_ga4:
+        notice = ("Google Analytics returned no data for this period, so the GA4 "
+                  "figures below are blank. The Clarity figures are unaffected.")
+
     print("Building email...")
     end   = datetime.now()
     start = end - timedelta(days=NUM_DAYS)
     subject = f"Niro Health Report · {start.strftime('%b %d')}–{end.strftime('%b %d')}"
-    html = build_email(clarity, ga4_data)
+    html = _with_notice(build_email(clarity or {}, ga4_data), notice)
 
     print("Sending email...")
     send_email(subject, html)
