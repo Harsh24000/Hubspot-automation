@@ -50,6 +50,20 @@ def _avatar_html(name: str, avatar_url: str = None) -> str:
     )
 
 
+def _client_badge_html(task: dict) -> str:
+    """Client Name pill. Returns '' when the task has no client, so tasks
+    without one look exactly as they did before."""
+    client = (task.get("client_name") or "").strip()
+    if not client:
+        return ""
+    return (
+        f'<span style="font-size:11px;font-weight:600;font-family:Arial,sans-serif;'
+        f'background:#EEF2FF;color:#3730A3;padding:3px 10px;border-radius:12px;'
+        f'white-space:nowrap;border:1px solid #C7D2FE;">'
+        f'&#128100;&nbsp;{client}</span>'
+    )
+
+
 def _task_row_html(task: dict) -> str:
     module = task.get("product_module", "N/A") or "N/A"
     col = _module_color(module)
@@ -75,6 +89,11 @@ def _task_row_html(task: dict) -> str:
         f'border-radius:12px;white-space:nowrap;">{module}</span>'
     )
 
+    # Empty string for tasks with no client, so those rows render unchanged.
+    client_badge = _client_badge_html(task)
+    if client_badge:
+        client_badge += "&nbsp;"
+
     return f"""
     <tr>
       <td style="padding:0 0 12px 0;">
@@ -82,11 +101,11 @@ def _task_row_html(task: dict) -> str:
                style="background:#FFFFFF;border:1px solid #E2E8F0;border-radius:10px;overflow:hidden;">
           <tr>
             <td style="padding:14px 18px;">
-              <!-- Top row: task id + module badge -->
+              <!-- Top row: task id + client + module badges -->
               <table cellpadding="0" cellspacing="0" border="0" width="100%">
                 <tr>
                   <td style="vertical-align:middle;">{task_id_badge}</td>
-                  <td align="right" style="vertical-align:middle;">{module_badge}</td>
+                  <td align="right" style="vertical-align:middle;">{client_badge}{module_badge}</td>
                 </tr>
               </table>
               <!-- Task name -->
