@@ -68,6 +68,64 @@ def _parse_est_hours(comment_text: str) -> float:
     return number / 60.0  # minutes -> hours
 
 
+# Most specific first, so a "Client Name" field wins over a "Client Type" one.
+_CLIENT_FIELD_HINTS = ("client name", "client_name", "client")
+
+
+def _custom_field_text(field: dict) -> str:
+    """Decode one ClickUp custom field to display text, or '' if it has none.
+
+    Same decoding as _get_product_module, but returns '' instead of 'N/A' —
+    an empty string is the signal to hide the badge entirely.
+    """
+    value = field.get("value")
+    if value is None or value == "":
+        return ""
+
+    field_type = field.get("type", "")
+
+    if field_type == "drop_down":
+        options = field.get("type_config", {}).get("options", [])
+        for opt in options:
+            if str(opt.get("orderindex", "")) == str(value) or opt.get("id") == str(value):
+                return (opt.get("name") or "").strip()
+        try:
+            return (options[int(value)].get("name") or "").strip()
+        except (IndexError, ValueError, TypeError, AttributeError):
+            return str(value).strip()
+
+    if field_type == "labels":
+        options = field.get("type_config", {}).get("options", [])
+        matched = [o.get("name", "") for o in options if o.get("id") in (value or [])]
+        return ", ".join(n for n in matched if n)
+
+    if isinstance(value, dict):
+        return str(value.get("name") or value.get("value") or "").strip()
+
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                parts.append(str(item.get("name") or item.get("username") or "").strip())
+            else:
+                parts.append(str(item).strip())
+        return ", ".join(p for p in parts if p)
+
+    return str(value).strip()
+
+
+def _get_client_name(task: dict) -> str:
+    """The task's Client Name custom field, or '' when the task has none."""
+    fields = task.get("custom_fields") or []
+    for hint in _CLIENT_FIELD_HINTS:
+        for field in fields:
+            if hint in (field.get("name") or "").lower():
+                text = _custom_field_text(field)
+                if text and text.upper() != "N/A":
+                    return text
+    return ""
+
+
 def _get_product_module(task: dict) -> str:
     """
     Extract 'Product Module' from ClickUp custom fields.
@@ -140,6 +198,7 @@ def process_task(client: ClickUpClient, task: dict, person_tasks: Dict[str, List
             assignees = [{"username": "Unassigned", "email": "", "profilePicture": None}]
 
         product_module = _get_product_module(task)
+        client_name = _get_client_name(task)
         est_hours = _parse_est_hours(comment_text)
 
         for assignee in assignees:
@@ -155,6 +214,7 @@ def process_task(client: ClickUpClient, task: dict, person_tasks: Dict[str, List
                 "comment": comment_text,
                 "est_hours": est_hours,
                 "product_module": product_module,
+                "client_name": client_name,
                 "task_url": task.get("url", "#"),
                 "avatar": assignee.get("profilePicture"),
                 "user_id": assignee.get("id"),
