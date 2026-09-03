@@ -2,3 +2,14 @@ __pycache__/
 *.pyc
 *.csv
 .env
+# runtime state — lives in the Actions cache, never in the repo
+scripts/clickup_dailymail/morning_snapshot.json
+scripts/clickup_dailymail/week_memory.json
+
+# local preview / debug artefacts — never push these
+scripts/monthly_report/*.png
+scripts/monthly_report/*.html
+scripts/weekly_report/*.png
+scripts/weekly_report/*.html
+scripts/clickup_dailymail/*.png
+scripts/clickup_dailymail/preview_*.html
