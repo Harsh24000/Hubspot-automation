@@ -1,6 +1,7 @@
 from datetime import date
 from typing import Dict, List
 import hashlib
+import re
 
 
 # Palette of vivid badge colors for Product Modules (cycles via hash)
@@ -184,9 +185,109 @@ def _person_section_html(name: str, tasks: List[dict], total_hours: float, logge
     </table>"""
 
 
+def _esc(text: str) -> str:
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _takeaway_html(text: str) -> str:
+    """Render the key-takeaway paragraph, honouring **bold** markers.
+
+    Everything is escaped first, so nothing in a task name or a model response
+    can inject markup; only the ** ** pairs become <strong>.
+    """
+    if not text:
+        return ""
+    safe = _esc(text)
+    safe = re.sub(r"\*\*(.+?)\*\*", r'<strong style="color:#0F172A;">\1</strong>', safe)
+    return f"""
+      <table cellpadding="0" cellspacing="0" border="0" width="100%"
+             style="margin:14px 0 0;border-top:1px solid #E2E8F0;">
+        <tr>
+          <td style="padding:12px 0 0;">
+            <p style="margin:0 0 4px;font-family:Arial,sans-serif;font-size:11px;
+                      font-weight:700;letter-spacing:1.2px;color:#94A3B8;
+                      text-transform:uppercase;">Key takeaway</p>
+            <p style="margin:0;font-family:Arial,sans-serif;font-size:13px;
+                      line-height:1.6;color:#475569;">{safe}</p>
+          </td>
+        </tr>
+      </table>"""
+
+
+def _summary_html(person_tasks: Dict[str, List[dict]],
+                  person_totals: Dict[str, float],
+                  person_logged_hours: Dict[str, float],
+                  key_takeaway: str = "") -> str:
+    """Per-person summary with each person's task names nested beneath."""
+    if not person_tasks:
+        return ""
+
+    total_tasks = sum(len(t) for t in person_tasks.values())
+    total_est = sum(person_totals.values())
+    total_logged = sum(person_logged_hours.values())
+
+    blocks = ""
+    for name, tasks in sorted(person_tasks.items()):
+        est = _fmt_hours(person_totals.get(name, 0.0))
+        logged = _fmt_hours(person_logged_hours.get(name, 0.0))
+        word = "task" if len(tasks) == 1 else "tasks"
+
+        items = ""
+        for task in tasks:
+            client = (task.get("client_name") or "").strip()
+            client_bit = (f' <span style="color:#3730A3;font-size:12px;">'
+                          f'&middot; {_esc(client)}</span>') if client else ""
+            items += f"""
+            <tr>
+              <td style="padding:2px 0 2px 16px;font-family:Arial,sans-serif;
+                         font-size:13px;color:#475569;line-height:1.5;">
+                <span style="color:#CBD5E1;">&bull;</span>&nbsp;{_esc(task.get("task_name", "Untitled"))}{client_bit}
+              </td>
+            </tr>"""
+
+        blocks += f"""
+        <tr>
+          <td style="padding:10px 0 4px;">
+            <p style="margin:0;font-family:Arial,sans-serif;font-size:13px;
+                      font-weight:700;color:#0F172A;">
+              {_esc(name)}
+              <span style="font-weight:400;color:#64748B;">&mdash;
+                {len(tasks)} {word} &nbsp;|&nbsp;
+                <span style="color:#4F46E5;font-weight:700;">{est}</span> estimated &nbsp;|&nbsp;
+                <span style="color:#059669;font-weight:700;">{logged}</span> logged
+              </span>
+            </p>
+            <table cellpadding="0" cellspacing="0" border="0" width="100%"
+                   style="margin-top:4px;">{items}
+            </table>
+          </td>
+        </tr>"""
+
+    return f"""
+    <table cellpadding="0" cellspacing="0" border="0" width="100%"
+           style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:12px;
+                  margin:0 0 24px 0;">
+      <tr>
+        <td style="padding:16px 20px 14px;">
+          <p style="margin:0 0 2px;font-family:Arial,sans-serif;font-size:11px;
+                    font-weight:700;letter-spacing:1.2px;color:#94A3B8;
+                    text-transform:uppercase;">Summary</p>
+          <p style="margin:0;font-family:Arial,sans-serif;font-size:12px;color:#64748B;">
+            {len(person_tasks)} members &nbsp;|&nbsp; {total_tasks} tasks &nbsp;|&nbsp;
+            {_fmt_hours(total_est)} estimated &nbsp;|&nbsp; {_fmt_hours(total_logged)} logged
+          </p>
+          <table cellpadding="0" cellspacing="0" border="0" width="100%">{blocks}
+          </table>
+          {_takeaway_html(key_takeaway)}
+        </td>
+      </tr>
+    </table>"""
+
+
 def generate_email_html(person_tasks: Dict[str, List[dict]], report_date: date,
                          person_totals: Dict[str, float] = None,
-                         person_logged_hours: Dict[str, float] = None) -> str:
+                         person_logged_hours: Dict[str, float] = None,
+                         key_takeaway: str = "") -> str:
     today_str = report_date.strftime("%A, %B %d %Y")
     day_label = report_date.strftime("%A").upper()
     total_people = len(person_tasks)
@@ -195,6 +296,8 @@ def generate_email_html(person_tasks: Dict[str, List[dict]], report_date: date,
     person_logged_hours = person_logged_hours or {}
     grand_total_hours = sum(person_totals.values())
     grand_logged_hours = sum(person_logged_hours.values())
+
+    summary = _summary_html(person_tasks, person_totals, person_logged_hours, key_takeaway)
 
     person_sections = "".join(
         _person_section_html(name, tasks, person_totals.get(name, 0.0), person_logged_hours.get(name, 0.0))
@@ -299,6 +402,7 @@ def generate_email_html(person_tasks: Dict[str, List[dict]], report_date: date,
           <tr>
             <td style="background:#FFFFFF;border-left:1px solid #E2E8F0;border-right:1px solid #E2E8F0;
                         padding:28px 24px 12px;">
+              {summary}
               {person_sections}
             </td>
           </tr>
