@@ -17,6 +17,8 @@ from typing import Dict, List
 
 from clickup_client import ClickUpClient
 from email_template_evening import generate_email_html
+import summary
+import week_memory
 
 SNAPSHOT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "morning_snapshot.json")
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -171,6 +173,49 @@ def _get_product_module(task: dict) -> str:
             return ", ".join(matched) if matched else "N/A"
         return str(value).strip() or "N/A"
     return "N/A"
+
+
+def apply_week_memory(report: Dict[str, dict]) -> None:
+    """Stamp each unplanned task with how many days this week it has been unplanned.
+
+    Sets task["week_occurrences"]: 1 = first time this week, 2+ = it keeps
+    coming back. The template only shows a badge from 2 upwards.
+
+    The whole thing is best-effort. If the cache had nothing to restore, every
+    task simply reads as its first occurrence and the email renders as it
+    always did — this must never be able to fail the run.
+    """
+    try:
+        memory = week_memory.load()
+    except Exception as exc:                      # pragma: no cover - defensive
+        print(f"  [warn] Week memory unavailable ({exc}) — continuing without it.")
+        for data in report.values():
+            for task in data.get("unplanned", []):
+                task["week_occurrences"] = 1
+        return
+
+    known_before = len(memory.get("unplanned", {}))
+
+    for person, data in report.items():
+        for task in data.get("unplanned", []):
+            count = week_memory.record_unplanned(
+                memory,
+                task.get("task_id", ""),
+                task.get("task_name", ""),
+                person,
+            )
+            task["week_occurrences"] = count
+
+    repeats = sum(
+        1
+        for data in report.values()
+        for task in data.get("unplanned", [])
+        if task.get("week_occurrences", 1) >= 2
+    )
+    print(f"Week memory ({memory.get('week')}): {known_before} task(s) carried in, "
+          f"{repeats} repeat unplanned today")
+
+    week_memory.save(memory)
 
 
 def build_report(client: ClickUpClient, snapshot: dict, time_entries: List[dict]) -> Dict[str, dict]:
@@ -371,6 +416,8 @@ def main() -> None:
         print("No time logged today — no email sent.")
         return
 
+    apply_week_memory(report)
+
     total_planned = sum(len(r["planned"]) for r in report.values())
     total_unplanned = sum(len(r["unplanned"]) for r in report.values())
     print(f"\nSummary: {len(report)} people | {total_planned} planned | {total_unplanned} unplanned")
@@ -378,7 +425,12 @@ def main() -> None:
         print(f"  {user}: {len(data['planned'])} planned, {len(data['unplanned'])} unplanned")
 
     report_date = date.today()
-    html = generate_email_html(report, report_date, have_snapshot=have_snapshot)
+    print("Building key takeaway...")
+    takeaway = summary.key_takeaway(summary.evening_facts(report, have_snapshot))
+    print(f"  {takeaway}")
+
+    html = generate_email_html(report, report_date, have_snapshot=have_snapshot,
+                               key_takeaway=takeaway)
     subject = f"Evening Report — {report_date.strftime('%A, %b %d')}"
     if not have_snapshot:
         subject += " (logged time only)"
