@@ -25,6 +25,7 @@ from typing import Dict, List
 
 from clickup_client import ClickUpClient
 from email_template import generate_email_html
+import summary
 
 SNAPSHOT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "morning_snapshot.json")
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -403,8 +404,14 @@ def main() -> None:
               f"{person_logged_hours.get(name, 0.0):.1f}h logged")
 
     report_date = date.today()
+    print("Building key takeaway...")
+    takeaway = summary.key_takeaway(
+        summary.morning_facts(person_tasks, person_totals, person_logged_hours))
+    print(f"  {takeaway}")
+
     html = generate_email_html(person_tasks, report_date, person_totals=person_totals,
-                                person_logged_hours=person_logged_hours)
+                                person_logged_hours=person_logged_hours,
+                                key_takeaway=takeaway)
     subject = f"Daily Updates — {today_ist.strftime('%A, %b %d')}"
 
     send_email(html, subject, {
