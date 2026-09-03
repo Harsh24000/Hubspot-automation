@@ -29,6 +29,7 @@ jobs:
           EMAIL_FROM:         ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_TO:           ${{ secrets.CLICKUP_MAIL_RECIPIENTS }}
+          GROQ_API_KEY:       ${{ secrets.GROQ_API_KEY }}
         run: python main.py
 
       - name: Cache morning snapshot for evening script
