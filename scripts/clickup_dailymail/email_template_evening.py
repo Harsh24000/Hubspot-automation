@@ -1,6 +1,7 @@
 from datetime import date
 from typing import Dict
 import hashlib
+import re
 
 
 MODULE_PALETTES = [
@@ -45,6 +46,34 @@ def _avatar_html(name: str, avatar_url: str = None) -> str:
         f'color:#ffffff;text-align:center;line-height:44px;flex-shrink:0;">'
         f'{initials}</div>'
     )
+
+
+def _repeat_badge_html(task: dict) -> str:
+    """'3rd time this week' pill for a task that keeps coming back unplanned.
+
+    Hidden on the first occurrence, and hidden entirely when the week memory
+    was unavailable (every task then reads as 1), so the email degrades to
+    exactly its previous appearance rather than showing misleading counts.
+    """
+    n = task.get("week_occurrences", 1)
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return ""
+    if n < 2:
+        return ""
+    return (
+        f'<span style="font-size:11px;font-weight:700;font-family:Arial,sans-serif;'
+        f'background:#FEF2F2;color:#B91C1C;padding:3px 10px;border-radius:12px;'
+        f'white-space:nowrap;border:1px solid #FECACA;">'
+        f'&#128260;&nbsp;{_ordinal(n)} time this week</span>'
+    )
+
+
+def _ordinal(n: int) -> str:
+    if 10 <= (n % 100) <= 20:
+        return f"{n}th"
+    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th') }"
 
 
 def _client_badge_html(task: dict) -> str:
@@ -158,6 +187,10 @@ def _unplanned_row_html(task: dict, have_snapshot: bool = True) -> str:
     if client_badge:
         client_badge += "&nbsp;"
 
+    repeat_badge = _repeat_badge_html(task)
+    if repeat_badge:
+        repeat_badge += "&nbsp;"
+
     return f"""
     <tr>
       <td style="padding:0 0 10px 0;">
@@ -171,7 +204,7 @@ def _unplanned_row_html(task: dict, have_snapshot: bool = True) -> str:
                   <td align="right" style="vertical-align:middle;">
                     <table cellpadding="0" cellspacing="0" border="0">
                       <tr>
-                        <td style="padding-right:6px;">{client_badge}{module_badge}</td>
+                        <td style="padding-right:6px;">{repeat_badge}{client_badge}{module_badge}</td>
                         <td>
                           <span style="font-size:11px;font-weight:600;font-family:Arial,sans-serif;
                                         background:#FFF7ED;color:#EA580C;padding:3px 10px;
@@ -274,8 +307,130 @@ def _person_section_html(name: str, data: dict, have_snapshot: bool = True) -> s
     </table>"""
 
 
+def _esc(text: str) -> str:
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _takeaway_html(text: str) -> str:
+    """Key-takeaway paragraph. Escaped first, then ** ** becomes <strong>."""
+    if not text:
+        return ""
+    safe = _esc(text)
+    safe = re.sub(r"\*\*(.+?)\*\*", r'<strong style="color:#1E293B;">\1</strong>', safe)
+    return f"""
+      <table cellpadding="0" cellspacing="0" border="0" width="100%"
+             style="margin:14px 0 0;border-top:1px solid #E2E8F0;">
+        <tr>
+          <td style="padding:12px 0 0;">
+            <p style="margin:0 0 4px;font-family:Arial,sans-serif;font-size:11px;
+                      font-weight:700;letter-spacing:1.2px;color:#94A3B8;
+                      text-transform:uppercase;">Key takeaway</p>
+            <p style="margin:0;font-family:Arial,sans-serif;font-size:13px;
+                      line-height:1.6;color:#475569;">{safe}</p>
+          </td>
+        </tr>
+      </table>"""
+
+
+def _summary_html(report: Dict[str, dict], have_snapshot: bool = True,
+                  key_takeaway: str = "") -> str:
+    """Per-person summary with each person's task names nested beneath."""
+    if not report:
+        return ""
+
+    total_planned = sum(len(d.get("planned", [])) for d in report.values())
+    total_unplanned = sum(len(d.get("unplanned", [])) for d in report.values())
+    total_ms = sum(d.get("total_logged_ms", 0) for d in report.values())
+
+    blocks = ""
+    for name, data in sorted(report.items()):
+        planned = data.get("planned", []) or []
+        unplanned = data.get("unplanned", []) or []
+        count = len(planned) + len(unplanned)
+        word = "task" if count == 1 else "tasks"
+        logged = _fmt_hours_from_ms(data.get("total_logged_ms", 0))
+
+        if have_snapshot:
+            meta = (f'{count} {word} &nbsp;|&nbsp; '
+                    f'<span style="color:#6366F1;font-weight:700;">{len(planned)}</span> planned '
+                    f'&nbsp;|&nbsp; '
+                    f'<span style="color:#EA580C;font-weight:700;">{len(unplanned)}</span> unplanned '
+                    f'&nbsp;|&nbsp; '
+                    f'<span style="color:#059669;font-weight:700;">{logged}</span> logged')
+        else:
+            meta = (f'{count} {word} &nbsp;|&nbsp; '
+                    f'<span style="color:#059669;font-weight:700;">{logged}</span> logged')
+
+        items = ""
+        for task in planned + unplanned:
+            is_unplanned = task in unplanned
+            tag = ""
+            if is_unplanned and have_snapshot:
+                tag = ' <span style="color:#EA580C;font-size:12px;">&middot; unplanned</span>'
+            try:
+                occ = int(task.get("week_occurrences", 1) or 1)
+            except (TypeError, ValueError):
+                occ = 1
+            if is_unplanned and occ >= 2:
+                tag += (f' <span style="color:#B91C1C;font-size:12px;font-weight:700;">'
+                        f'&middot; {_ordinal(occ)} time this week</span>')
+            client = (task.get("client_name") or "").strip()
+            if client:
+                tag += (f' <span style="color:#3730A3;font-size:12px;">'
+                        f'&middot; {_esc(client)}</span>')
+
+            items += f"""
+            <tr>
+              <td style="padding:2px 0 2px 16px;font-family:Arial,sans-serif;
+                         font-size:13px;color:#475569;line-height:1.5;">
+                <span style="color:#CBD5E1;">&bull;</span>&nbsp;{_esc(task.get("task_name", "Untitled"))}{tag}
+              </td>
+            </tr>"""
+
+        blocks += f"""
+        <tr>
+          <td style="padding:10px 0 4px;">
+            <p style="margin:0;font-family:Arial,sans-serif;font-size:13px;
+                      font-weight:700;color:#1E293B;">
+              {_esc(name)}
+              <span style="font-weight:400;color:#64748B;">&mdash; {meta}</span>
+            </p>
+            <table cellpadding="0" cellspacing="0" border="0" width="100%"
+                   style="margin-top:4px;">{items}
+            </table>
+          </td>
+        </tr>"""
+
+    if have_snapshot:
+        totals = (f'{len(report)} members &nbsp;|&nbsp; {total_planned} planned '
+                  f'&nbsp;|&nbsp; {total_unplanned} unplanned &nbsp;|&nbsp; '
+                  f'{_fmt_hours_from_ms(total_ms)} logged')
+    else:
+        totals = (f'{len(report)} members &nbsp;|&nbsp; '
+                  f'{total_planned + total_unplanned} tasks &nbsp;|&nbsp; '
+                  f'{_fmt_hours_from_ms(total_ms)} logged')
+
+    return f"""
+    <table cellpadding="0" cellspacing="0" border="0" width="100%"
+           style="background:#FFFFFF;border:1px solid #E2E8F0;border-radius:12px;
+                  margin:0 0 22px 0;">
+      <tr>
+        <td style="padding:16px 20px 14px;">
+          <p style="margin:0 0 2px;font-family:Arial,sans-serif;font-size:11px;
+                    font-weight:700;letter-spacing:1.2px;color:#94A3B8;
+                    text-transform:uppercase;">Summary</p>
+          <p style="margin:0;font-family:Arial,sans-serif;font-size:12px;color:#64748B;">{totals}</p>
+          <table cellpadding="0" cellspacing="0" border="0" width="100%">{blocks}
+          </table>
+          {_takeaway_html(key_takeaway)}
+        </td>
+      </tr>
+    </table>"""
+
+
 def generate_email_html(report: Dict[str, dict], report_date: date,
-                        have_snapshot: bool = True) -> str:
+                        have_snapshot: bool = True,
+                        key_takeaway: str = "") -> str:
     today_str = report_date.strftime("%A, %B %d %Y")
     day_label = report_date.strftime("%A").upper()
     total_people = len(report)
@@ -291,6 +446,8 @@ def generate_email_html(report: Dict[str, dict], report_date: date,
         '<strong>No morning plan was recorded today.</strong> Showing time logged in '
         'ClickUp only &mdash; work is not split into planned vs unplanned.</p>'
         '</td></tr></table>')
+
+    summary = _summary_html(report, have_snapshot, key_takeaway)
 
     person_sections = "".join(
         _person_section_html(name, data, have_snapshot)
@@ -377,6 +534,7 @@ def generate_email_html(report: Dict[str, dict], report_date: date,
             <td style="background:#F8FAFC;border:1px solid #E2E8F0;border-top:none;
                         border-bottom:none;padding:24px 20px 8px;">
               {no_plan_banner}
+              {summary}
               {person_sections}
             </td>
           </tr>
