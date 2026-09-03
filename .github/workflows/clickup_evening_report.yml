@@ -19,7 +19,11 @@ jobs:
         run: pip install requests
 
       - name: Set today's date
-        run: echo "TODAY=$(date -u '+%Y-%m-%d')" >> $GITHUB_ENV
+        run: |
+          echo "TODAY=$(date -u '+%Y-%m-%d')" >> $GITHUB_ENV
+          # ISO week (%G-W%V), so the memory rolls over on Monday and a run
+          # late on Sunday cannot bleed into the next week's history.
+          echo "WEEK=$(date -u '+%G-W%V')" >> $GITHUB_ENV
 
       # The morning plan is OPTIONAL. fail-on-cache-miss used to be true, which
       # killed this job before Python even started whenever the morning report
@@ -34,6 +38,21 @@ jobs:
           key: morning-snapshot-${{ env.TODAY }}
           fail-on-cache-miss: false
 
+      # Week-to-date memory: which tasks have already been unplanned earlier
+      # this week. Restored by PREFIX, because cache keys are immutable — each
+      # run saves under its own unique key and this picks the newest match from
+      # the same ISO week. A miss is fine: the report just loses the "Nth time
+      # this week" badges for one run.
+      - name: Restore week memory (optional)
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: scripts/clickup_dailymail/week_memory.json
+          key: week-memory-${{ env.WEEK }}-${{ env.TODAY }}
+          restore-keys: |
+            week-memory-${{ env.WEEK }}-
+          fail-on-cache-miss: false
+
       - name: Run evening report
         working-directory: scripts/clickup_dailymail
         env:
@@ -42,4 +61,15 @@ jobs:
           EMAIL_FROM:         ${{ secrets.GMAIL_ADDRESS }}
           EMAIL_PASSWORD:     ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_TO:           ${{ secrets.CLICKUP_MAIL_RECIPIENTS }}
+          GROQ_API_KEY:       ${{ secrets.GROQ_API_KEY }}
         run: python main_evening.py
+
+      # run_id keeps the key unique — saving to an existing key is a no-op in
+      # the Actions cache, which would silently freeze the memory on day one.
+      - name: Save week memory
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: scripts/clickup_dailymail/week_memory.json
+          key: week-memory-${{ env.WEEK }}-${{ env.TODAY }}-${{ github.run_id }}
