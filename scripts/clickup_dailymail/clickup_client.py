@@ -77,6 +77,47 @@ class ClickUpClient:
 
     # ── Tasks ────────────────────────────────────────────────────────────────
 
+    def get_tasks_updated_since(self, team_id: str, since_ms: int) -> List[Dict]:
+        """Every open task in the WHOLE workspace updated since `since_ms`.
+
+        This replaces the space -> list -> task walk plus the per-task subtask
+        recursion, which together cost about two API calls for every task in
+        the workspace (~5,000 calls, ~65 minutes at the 0.68s throttle).
+
+        ClickUp's filtered team-tasks endpoint does the same job server-side in
+        a handful of paginated calls, and `subtasks=true` brings subtasks back
+        as first-class results so nothing needs walking by hand.
+
+        Caveat worth knowing: this relies on ClickUp bumping a task's
+        date_updated when a comment is posted. That behaviour is NOT documented
+        by ClickUp, so main.py logs what this filter saw and falls back to the
+        full walk if it comes back empty. Run with FULL_SCAN=1 to compare.
+        """
+        tasks: List[Dict] = []
+        seen: set = set()
+        page = 0
+        while True:
+            data = self._get(f"team/{team_id}/task", {
+                "date_updated_gt": since_ms,
+                "subtasks": "true",
+                "include_closed": "false",
+                "page": page,
+            })
+            batch = data.get("tasks", [])
+            for t in batch:
+                if t.get("id") and t["id"] not in seen:
+                    seen.add(t["id"])
+                    tasks.append(t)
+            # last_page is not always present; an empty batch also ends it.
+            if not batch or data.get("last_page", True):
+                break
+            page += 1
+            if page > 50:                    # safety valve, ~5,000 tasks
+                print("  [warn] stopped paginating team tasks at page 50")
+                break
+        return tasks
+
+
     def get_tasks(self, list_id: str) -> List[Dict]:
         """
         Phase 1 — fetch ALL open root tasks in the list (no due-date filter —
