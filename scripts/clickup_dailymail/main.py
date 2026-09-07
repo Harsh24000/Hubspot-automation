@@ -222,7 +222,13 @@ def process_task(client: ClickUpClient, task: dict, person_tasks: Dict[str, List
             })
 
 
-def collect_tasks(client: ClickUpClient, team_id: str) -> Dict[str, List[dict]]:
+def _collect_full_scan(client: ClickUpClient, team_id: str) -> Dict[str, List[dict]]:
+    """The original exhaustive walk: every space, every list, every task.
+
+    Correct but expensive — roughly two API calls per task in the workspace,
+    about 5,000 calls and 65 minutes at the 0.68s throttle. Kept as the
+    fallback and as the comparison baseline (FULL_SCAN=1).
+    """
     person_tasks: Dict[str, List[dict]] = defaultdict(list)
 
     spaces = client.get_spaces(team_id)
@@ -242,6 +248,52 @@ def collect_tasks(client: ClickUpClient, team_id: str) -> Dict[str, List[dict]]:
                 process_task(client, task, person_tasks)
                 time.sleep(0.05)
 
+    return person_tasks
+
+
+def collect_tasks(client: ClickUpClient, team_id: str) -> Dict[str, List[dict]]:
+    """Fast path: only look at tasks touched since midnight IST.
+
+    An `est Xhr` comment posted today can only sit on a task that was touched
+    today, so scanning the whole workspace was wasted work. This asks ClickUp
+    for just those tasks in a few paginated calls, then fetches comments for
+    each — cutting ~5,000 API calls to roughly 100.
+
+    Two safety nets, because ClickUp does not document whether posting a
+    comment bumps a task's date_updated:
+      * if the filter returns nothing at all, fall back to the full walk
+      * FULL_SCAN=1 forces the old exhaustive walk, so you can run both on the
+        same day and compare the results
+    """
+    if os.environ.get("FULL_SCAN") == "1":
+        print("FULL_SCAN=1 — running the exhaustive walk (slow, ~65 min).")
+        return _collect_full_scan(client, team_id)
+
+    start_ms, _ = _today_range_ms()
+    print(f"Fetching tasks updated since midnight IST "
+          f"({datetime.fromtimestamp(start_ms / 1000, IST):%Y-%m-%d %H:%M})...")
+    tasks = client.get_tasks_updated_since(team_id, start_ms)
+    print(f"  {len(tasks)} task(s) touched today — checking comments on each")
+
+    if not tasks:
+        # Either genuinely nothing happened today, or the date filter does not
+        # behave as assumed. Cannot tell them apart, so take the safe branch.
+        print("  Filter returned ZERO tasks — falling back to the full walk "
+              "rather than sending an empty report.")
+        return _collect_full_scan(client, team_id)
+
+    person_tasks: Dict[str, List[dict]] = defaultdict(list)
+    for task in tasks:
+        process_task(client, task, person_tasks)
+
+    found = sum(len(v) for v in person_tasks.values())
+    print(f"\nScanned {len(tasks)} task(s), ~{len(tasks) + 5} API calls "
+          f"(the full walk costs ~5,000).")
+    print(f"Found {found} task(s) with an est comment posted today.")
+    if not found:
+        print("  NOTE: no est comments today. If you expected some, run this "
+              "workflow again with FULL_SCAN=1 to check whether the date "
+              "filter missed them.")
     return person_tasks
 
 
