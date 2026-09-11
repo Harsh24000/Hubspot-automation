@@ -46,6 +46,7 @@ ASSUMPTIONS
 import os
 import re
 import sys
+import html
 import smtplib
 from collections import defaultdict
 from datetime import date, datetime, timezone, timedelta
@@ -152,6 +153,44 @@ def _assignees(task: dict) -> list:
 
 def _is_closed(task: dict) -> bool:
     return (task.get('status') or {}).get('type') == 'closed'
+
+
+# How much of a ticket description to show under the client row. Long enough to
+# be useful at a glance, short enough that ten tickets still fit on a screen.
+_TICKET_DESC_CHARS = 150
+
+
+def _ticket_text(task: dict) -> tuple:
+    """(title, description) for one support ticket, both plain text.
+
+    ClickUp gives the human-written body in `text_content` (plain) or
+    `description` (may carry markdown). Either can be absent, empty, or None —
+    `.get(k, '')` returns None when the key EXISTS with a null value, which is
+    why each is coerced rather than defaulted.
+    """
+    title = str(task.get('name') or '').strip() or '(untitled ticket)'
+
+    body = ''
+    for key in ('text_content', 'description'):
+        value = task.get(key)
+        if value is None:
+            continue
+        value = str(value).strip()
+        if value:
+            body = value
+            break
+
+    # Collapse whitespace so a multi-line description stays on one row, and
+    # drop the markdown image/link noise ClickUp descriptions often carry.
+    body = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', body)          # ![img](url)
+    body = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', body)      # [text](url) -> text
+    body = re.sub(r'\s+', ' ', body).strip()
+
+    if body == title:          # some tickets repeat the title as the body
+        body = ''
+    if len(body) > _TICKET_DESC_CHARS:
+        body = body[:_TICKET_DESC_CHARS].rstrip() + '…'
+    return title, body
 
 
 def _is_milestone(task: dict) -> bool:
@@ -522,7 +561,8 @@ def build_customer_support(tickets: list, task_ms: Dict[str, int]) -> dict:
     """Support tickets that saw activity last week, grouped by client."""
     start_ms, end_ms = _last_week_range_ms()
     by_client = defaultdict(lambda: {'total': 0, 'resolved': 0, 'pending': 0,
-                                     'tracked_ms': 0, 'resources': set(), 'types': set()})
+                                     'tracked_ms': 0, 'resources': set(),
+                                     'types': set(), 'tickets': []})
     considered = 0
     for t in tickets:
         if not _touched_last_week(t, start_ms, end_ms, task_ms):
@@ -540,6 +580,15 @@ def build_customer_support(tickets: list, task_ms: Dict[str, int]) -> dict:
         ticket_type = _ticket_type_from_task(t)
         if ticket_type:
             entry['types'].add(ticket_type)
+
+        title, desc = _ticket_text(t)
+        entry['tickets'].append({
+            'title': title,
+            'desc': desc,
+            'closed': _is_closed(t),
+            'status': (t.get('status') or {}).get('status', '').title(),
+            'type': ticket_type,
+        })
 
     print(f'  Customer Support: {considered} of {len(tickets)} ticket(s) had activity last week')
     return by_client
@@ -592,6 +641,53 @@ def _milestone_block(milestones: dict) -> str:
             f'<div style="font-size:11px;font-weight:700;color:#64748b;'
             f'text-transform:uppercase;letter-spacing:1px;">Milestones</div>'
             f'{blocks}</div>')
+
+
+def _ticket_detail_row(tickets: list) -> str:
+    """The line that sits directly UNDER a client's support row.
+
+    Lists each ticket for that client by name, with its description, so the
+    reader can see WHAT the tickets were and not just how many. Resolved
+    tickets get a green tick, pending ones an amber hourglass, matching the
+    resolved/pending columns immediately above.
+
+    Everything here is ClickUp free text, so every field is HTML-escaped — a
+    ticket titled 'Report load < 5s & retry' would otherwise break the table.
+    """
+    if not tickets:
+        return ''
+
+    items = ''
+    for t in sorted(tickets, key=lambda x: (x['closed'], x['title'].lower())):
+        if t['closed']:
+            mark, colour = '&#10003;', '#059669'
+        else:
+            mark, colour = '&#9203;', '#b45309'
+
+        status = (f'<span style="color:{colour};font-size:10px;font-weight:700;'
+                  f'white-space:nowrap;">{mark} {html.escape(t["status"] or "")}</span>'
+                  ) if t['status'] else (
+                  f'<span style="color:{colour};font-size:10px;">{mark}</span>')
+
+        kind = (f'<span style="display:inline-block;margin-left:6px;padding:0 6px;'
+                f'border-radius:7px;background:#f1f5f9;color:#64748b;font-size:10px;'
+                f'white-space:nowrap;">{html.escape(t["type"])}</span>'
+                ) if t.get('type') else ''
+
+        desc = (f'<div style="font-size:11px;color:#64748b;margin:1px 0 0 14px;'
+                f'line-height:1.45;">{html.escape(t["desc"])}</div>'
+                ) if t['desc'] else ''
+
+        items += (f'<div style="padding:4px 0;">'
+                  f'<div style="font-size:12px;color:#0f172a;line-height:1.4;">'
+                  f'&bull; {html.escape(t["title"])}{kind} &nbsp;{status}</div>'
+                  f'{desc}</div>')
+
+    return (f'<tr><td colspan="7" style="padding:2px 12px 10px 26px;'
+            f'background:#fafafa;border-bottom:1px solid #f1f5f9;">'
+            f'<div style="font-size:10px;font-weight:700;color:#94a3b8;'
+            f'text-transform:uppercase;letter-spacing:1px;margin-bottom:2px;">'
+            f'Tickets</div>{items}</td></tr>')
 
 
 def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, report_date: date,
@@ -654,14 +750,17 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
     for client_name, d in sorted(support.items()):
         types = ', '.join(sorted(d['types'])) if d['types'] else '—'
         support_rows += (
-            f'<tr><td style="padding:8px 12px;font-size:12px;color:#0f172a;font-weight:600;">{client_name}</td>'
-            f'<td style="padding:8px 12px;font-size:12px;color:#475569;">{types}</td>'
+            f'<tr><td style="padding:8px 12px;font-size:12px;color:#0f172a;font-weight:600;">'
+            f'{html.escape(client_name)}</td>'
+            f'<td style="padding:8px 12px;font-size:12px;color:#475569;">{html.escape(types)}</td>'
             f'<td style="padding:8px 12px;font-size:12px;text-align:center;">{d["total"]}</td>'
             f'<td style="padding:8px 12px;font-size:12px;text-align:center;color:#166534;">{d["resolved"]}</td>'
             f'<td style="padding:8px 12px;font-size:12px;text-align:center;color:#b45309;">{d["pending"]}</td>'
             f'<td style="padding:8px 12px;font-size:12px;">{_fmt_duration(d["tracked_ms"])}</td>'
-            f'<td style="padding:8px 12px;font-size:12px;color:#64748b;">{", ".join(sorted(d["resources"]))}</td></tr>'
+            f'<td style="padding:8px 12px;font-size:12px;color:#64748b;">'
+            f'{html.escape(", ".join(sorted(d["resources"])))}</td></tr>'
         )
+        support_rows += _ticket_detail_row(d.get('tickets', []))
     if not support_rows:
         support_rows = ('<tr><td colspan="7" style="padding:12px;color:#94a3b8;font-size:13px;">'
                         'No support ticket activity last week.</td></tr>')
