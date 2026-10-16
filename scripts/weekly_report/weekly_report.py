@@ -21,8 +21,8 @@ for a client that had nothing at all last week.
 
 Three sections:
 
-1. Onboarding — ONLY clients in the "Active Onboardings" list, and only those
-   with time LOGGED last week. Tasks whose status is CLOSED are excluded, a
+1. Onboarding — ONLY clients under "Client Implementation" (a space, folder or
+   list of that name), and only those with time LOGGED in the window. Tasks whose status is CLOSED are excluded, a
    client whose tasks are all closed drops off, and a client with zero logged
    time is not given a row (their names go in one line under the table).
    Shows Client (with who logged the time), Status, Status Duration, Task
@@ -44,9 +44,15 @@ ASSUMPTIONS
 - "Ticket Type"  = a custom field whose name contains "ticket type" (falling
                    back to any field containing "type"). The field actually
                    matched is printed at startup so it can be verified.
-- "Active Onboardings" scope = the list (or folder) whose name contains
-  "Active Onboarding". Other lists with "onboarding" in the name are ignored
-  and named in the run log. Override with the ONBOARDING_LIST_NAME env var.
+- Onboarding scope = everything under "Client Implementation", whether that is
+  a ClickUp space, a folder or a list. Override with ONBOARDING_SCOPE_NAME.
+  Inside the CLIENT IMPLEMENTATIONS folder each list is one client
+  ("TRUtest Diagnostics Onboarding" -> TRUtest Diagnostics, "Maharaja Agrasen
+  Onboarding", "PSRI Discharge Summary"). The shared "Active Onboardings" list
+  in that folder is NOT reported (ONBOARDING_EXCLUDE_LISTS to change).
+- REPORT_WINDOW=this_week reports Monday 00:00 IST to now instead of last
+  week. `python weekly_report.py --preview` writes weekly_report_preview.html
+  and sends nothing (no Gmail settings needed).
 """
 
 import os
@@ -241,9 +247,23 @@ def build_resource_milestones(all_tasks: list, task_ms: Dict[str, int]) -> dict:
     return result
 
 
+def _this_week_mode() -> bool:
+    return (os.environ.get('REPORT_WINDOW') or '').strip().lower() in ('this_week', 'this-week', 'current')
+
+
+def _period() -> str:
+    """'last week' or 'this week', for the wording in the email."""
+    return 'this week' if _this_week_mode() else 'last week'
+
+
 def _last_week_range_ms() -> tuple:
-    """Monday 00:00 IST through Sunday 23:59:59 IST of the week before this run."""
+    """Monday 00:00 IST through Sunday 23:59:59 IST of the week before this run.
+    With REPORT_WINDOW=this_week: this Monday 00:00 IST through now."""
     now_ist = datetime.now(IST)
+    if _this_week_mode():
+        monday = (now_ist - timedelta(days=now_ist.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        return int(monday.timestamp() * 1000), int(now_ist.timestamp() * 1000)
     this_monday = (now_ist - timedelta(days=now_ist.weekday())).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
@@ -257,6 +277,8 @@ def _last_week_display() -> str:
     start_ms, end_ms = _last_week_range_ms()
     start = datetime.fromtimestamp(start_ms / 1000, tz=IST)
     end = datetime.fromtimestamp(end_ms / 1000, tz=IST)
+    if _this_week_mode():
+        return f"Monday {start.strftime('%d %b')} – {end.strftime('%A %d %b %Y')} (week to date)"
     return f"Monday {start.strftime('%d %b')} – Sunday {end.strftime('%d %b %Y')}"
 
 
@@ -331,6 +353,8 @@ def fetch_workspace_tasks(client: ClickUpClient, team_id: str) -> list:
         print(f'  Space: {space["name"]} — {len(lists)} list(s)')
         for lst in lists:
             tasks = client.get_tasks(lst['id'], include_closed=True, include_subtasks=False)
+            for t in tasks:
+                t['_space_name'] = space['name']   # tasks only carry the space id
             print(f'    → {lst["name"]}: {len(tasks)} task(s)')
             all_tasks.extend(tasks)
     return all_tasks
@@ -456,28 +480,94 @@ def _norm(text: str) -> str:
 
 
 def _onboarding_needle() -> str:
-    """The list/folder name that defines the onboarding section, normalised.
+    """The space/folder/list name that defines the onboarding section, normalised.
 
-    "Active Onboardings" -> "active onboarding", so the singular and plural
-    spellings both match. Override with ONBOARDING_LIST_NAME if the ClickUp
-    list is ever renamed.
+    Default "Client Implementation". A trailing "s" is dropped so singular and
+    plural both match. Override with ONBOARDING_SCOPE_NAME (ONBOARDING_LIST_NAME
+    is still honoured for older setups).
     """
-    needle = _norm(os.environ.get('ONBOARDING_LIST_NAME') or 'Active Onboardings')
+    needle = _norm(os.environ.get('ONBOARDING_SCOPE_NAME') or os.environ.get('ONBOARDING_LIST_NAME')
+                   or 'Client Implementation')
     return needle[:-1] if needle.endswith('s') else needle
 
 
-def _in_active_onboardings(task: dict) -> bool:
-    """True only for tasks in the "Active Onboardings" list (or a folder of
-    that name).
-
-    The previous rule was "any list whose name contains 'onboarding'", which
-    also swept in every other onboarding-ish list in the workspace and so
-    reported clients that are not being actively onboarded.
-    """
+def _scope_level(task: dict) -> str:
+    """'space', 'folder' or 'list' — where the Client Implementation name matched,
+    or '' when the task is outside it."""
     needle = _onboarding_needle()
+    if needle in _norm((task.get('list') or {}).get('name')):
+        return 'list'
+    folder = task.get('folder') or {}
+    if not folder.get('hidden') and needle in _norm(folder.get('name')):
+        return 'folder'
+    if needle in _norm(task.get('_space_name') or (task.get('space') or {}).get('name')):
+        return 'space'
+    return ''
+
+
+def _excluded_onboarding_lists() -> List[str]:
+    """Lists inside CLIENT IMPLEMENTATIONS that are NOT reported.
+    Default: the shared "Active Onboardings" list. Override with
+    ONBOARDING_EXCLUDE_LISTS (comma-separated; set it to "none" to include all)."""
+    raw = os.environ.get('ONBOARDING_EXCLUDE_LISTS')
+    raw = 'Active Onboardings' if raw is None else raw
+    if raw.strip().lower() == 'none':
+        return []
+    return [_norm(x).rstrip('s') for x in raw.split(',') if x.strip()]
+
+
+def _in_active_onboardings(task: dict) -> bool:
+    """True for tasks in the client lists under CLIENT IMPLEMENTATIONS
+    (TRUtest Diagnostics Onboarding, Maharaja Agrasen Onboarding, PSRI
+    Discharge Summary ...). The shared "Active Onboardings" list is left out."""
+    if not _scope_level(task):
+        return False
     list_name = _norm((task.get('list') or {}).get('name'))
-    folder_name = _norm((task.get('folder') or {}).get('name'))
-    return needle in list_name or needle in folder_name
+    return not any(x and x in list_name for x in _excluded_onboarding_lists())
+
+
+# Lists inside Client Implementations that hold SEVERAL clients (one task per
+# client). Every other list in the folder is one client's own project list.
+def _shared_onboarding_lists() -> List[str]:
+    raw = os.environ.get('ONBOARDING_SHARED_LISTS') or 'Active Onboardings'
+    return [_norm(x).rstrip('s') for x in raw.split(',') if x.strip()]
+
+
+_LIST_SUFFIX = re.compile(r'[\s\-–:|]*\b(onboardings?|implementations?|go[- ]?live|project)\s*$', re.I)
+
+
+def _client_from_list_name(list_name: str) -> str:
+    """'TRUtest Diagnostics Onboarding' -> 'TRUtest Diagnostics'.
+    'PSRI Discharge Summary' stays as it is."""
+    name = str(list_name or '').strip()
+    cleaned = _LIST_SUFFIX.sub('', name).strip()
+    return cleaned or name
+
+
+def _onboarding_client(task: dict) -> str:
+    """Who a Client Implementations task belongs to.
+
+    - A client's own list (TRUtest Diagnostics Onboarding, Maharaja Agrasen
+      Onboarding, PSRI Discharge Summary ...): the list IS the client, so the
+      list name is used, with a trailing "Onboarding"/"Implementation" removed.
+    - The shared "Active Onboardings" list (one task per client): the Client
+      custom field, falling back to the task name.
+    - Client Implementation as a space with a folder per client: folder name.
+    """
+    level = _scope_level(task)
+    list_name = (task.get('list') or {}).get('name') or ''
+    folder = task.get('folder') or {}
+    shared = any(n in _norm(list_name) for n in _shared_onboarding_lists())
+    if level == 'folder' and not shared:
+        return _client_from_list_name(list_name)
+    field = _client_name_from_task(task)
+    if field:
+        return field
+    if shared or level == 'list':
+        return str(task.get('name') or '').strip()
+    if level == 'space':
+        return folder.get('name') if folder.get('name') and not folder.get('hidden') else _client_from_list_name(list_name)
+    return ''
 
 
 # What build_onboarding left out, so the email can say so in one line instead
@@ -488,14 +578,14 @@ _ONBOARDING_NOTES = {'idle_clients': [], 'lists_in_scope': [], 'lists_ignored': 
 def build_onboarding(all_tasks: list, task_ms: Dict[str, int],
                      client: ClickUpClient = None,
                      person_task_ms: Dict[str, Dict[str, int]] = None) -> dict:
-    """Clients in the Active Onboardings list who had time LOGGED last week.
+    """Clients under Client Implementation who had time LOGGED in the window.
 
     A client appears only if all of these hold:
-      - the task sits in the "Active Onboardings" list (not just any list with
-        "onboarding" in its name)
+      - the task sits under Client Implementation (a space, folder or list of
+        that name)
       - the task is not closed
-      - the task saw activity last week
-      - the client's tasks add up to MORE THAN ZERO logged time last week.
+      - the task saw activity in the reporting window
+      - the client's tasks add up to MORE THAN ZERO logged time in the window.
         A client whose tasks were merely edited, with no time logged, is not
         shown as a row; their names go in a single line under the table.
     """
@@ -508,11 +598,11 @@ def build_onboarding(all_tasks: list, task_ms: Dict[str, int],
     for t in all_tasks:
         list_name = _project_name(t)
         if not _in_active_onboardings(t):
-            if 'onboard' in _norm(list_name):
+            if _scope_level(t) or 'onboard' in _norm(list_name) or 'implementation' in _norm(list_name):
                 ignored.add(list_name)
             continue
         in_scope.add(list_name)
-        client_name = _client_name_from_task(t)
+        client_name = _onboarding_client(t)
         if not client_name or 'niro' in client_name.lower():
             continue
         if _is_closed(t):
@@ -531,7 +621,7 @@ def build_onboarding(all_tasks: list, task_ms: Dict[str, int],
     _ONBOARDING_NOTES.update(idle_clients=idle, lists_in_scope=sorted(in_scope),
                              lists_ignored=sorted(ignored))
 
-    print(f'  Onboarding scope: list/folder name contains "{_onboarding_needle()}" '
+    print(f'  Onboarding scope: space/folder/list name contains "{_onboarding_needle()}" '
           f'-> {sorted(in_scope) or "NO MATCHING LIST FOUND"}')
     if ignored:
         print(f'  Onboarding: ignored other onboarding-named list(s): {sorted(ignored)}')
@@ -779,7 +869,7 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
     week_label = _last_week_display()
 
     # ── Section 1: Onboarding ──
-    # Only Active Onboardings clients with time logged last week reach here.
+    # Only Client Implementation clients with time logged in the window reach here.
     # Biggest logger first: the reader wants to know where the week went.
     grand_ms = sum(d.get('logged_ms', 0) for d in onboarding.values())
     all_people = {p for d in onboarding.values() for p, _ in d.get('people', [])}
@@ -809,14 +899,14 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
         )
     if not onboarding_rows:
         onboarding_rows = ('<tr><td colspan="6" style="padding:12px;color:#94a3b8;font-size:13px;">'
-                           'No time logged on Active Onboardings clients last week.</td></tr>')
+                           f'No time logged on Client Implementation clients {_period()}.</td></tr>')
 
     onboarding_total = (
         f'<table width="100%" cellpadding="0" cellspacing="0" '
         f'style="background:#0f2744;border-radius:10px;margin-bottom:14px;">'
         f'<tr><td style="padding:16px 20px;">'
         f'<div style="color:#93c5fd;font-size:10px;font-weight:700;letter-spacing:1.5px;'
-        f'text-transform:uppercase;">Total logged last week</div>'
+        f'text-transform:uppercase;">Total logged {_period()}</div>'
         f'<div style="color:#fff;font-size:30px;font-weight:800;line-height:1.1;margin-top:2px;">'
         f'{_fmt_duration(grand_ms)}</div>'
         f'<div style="color:rgba(255,255,255,0.62);font-size:12px;margin-top:4px;">'
@@ -826,7 +916,7 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
     idle = _ONBOARDING_NOTES.get('idle_clients') or []
     onboarding_idle = (
         f'<div style="font-size:11px;color:#94a3b8;margin-top:8px;">'
-        f'Active last week but no time logged (not shown): '
+        f'Active {_period()} but no time logged (not shown): '
         f'{html.escape(", ".join(idle))}</div>') if idle else ''
 
     # ── Section 2: Resource → Project Tracking ──
@@ -859,7 +949,7 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
       {_milestone_block((milestones or {}).get(resource, {}))}
     </div>'''
     if not tracking_html:
-        tracking_html = '<div style="color:#94a3b8;font-size:13px;">No time tracked last week.</div>'
+        tracking_html = f'<div style="color:#94a3b8;font-size:13px;">No time tracked {_period()}.</div>'
 
     # ── Section 3: Customer Support ──
     support_rows = ''
@@ -879,7 +969,7 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
         support_rows += _ticket_detail_row(d.get('tickets', []))
     if not support_rows:
         support_rows = ('<tr><td colspan="7" style="padding:12px;color:#94a3b8;font-size:13px;">'
-                        'No support ticket activity last week.</td></tr>')
+                        f'No support ticket activity {_period()}.</td></tr>')
 
     return f'''<!DOCTYPE html>
 <html lang="en">
@@ -890,13 +980,13 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
   <tr><td style="border-radius:20px 20px 0 0;overflow:hidden;background:linear-gradient(135deg,#0f2744 0%,#1a56a0 100%);padding:36px 32px;">
     <div style="color:#dbeafe;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">Weekly Ops Report &middot; {week_label}</div>
     <div style="color:#fff;font-size:28px;font-weight:800;">Weekly Report</div>
-    <div style="color:rgba(255,255,255,0.7);font-size:14px;margin-top:4px;">Sent {today_str} &middot; last week only</div>
+    <div style="color:rgba(255,255,255,0.7);font-size:14px;margin-top:4px;">Sent {today_str} &middot; {_period()} only</div>
   </td></tr>
   <tr><td style="height:4px;background:linear-gradient(90deg,#6366F1,#A855F7,#EC4899);"></td></tr>
 
   {_slab('&#128188; Onboarding', '#7c3aed')}
   <tr><td style="background:#fff;padding:20px 32px;">
-    {_section_title(f'Active Onboarding Clients — {week_label}')}
+    {_section_title(f'Client Implementation — {week_label}')}
     {onboarding_total}
     <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;">
       <tr style="background:#f5f3ff;">
@@ -913,7 +1003,7 @@ def build_email_html(onboarding: dict, resource_tracking: dict, support: dict, r
   </td></tr>
 
   {_slab('&#128100; Resource → Project Tracking', '#1a56a0')}
-  <tr><td style="background:#fff;padding:20px 32px;">{_section_title(f'Last Week — {week_label}')}{tracking_html}</td></tr>
+  <tr><td style="background:#fff;padding:20px 32px;">{_section_title(f'{_period().title()} — {week_label}')}{tracking_html}</td></tr>
 
   {_slab('&#127919; Customer Support', '#166534')}
   <tr><td style="background:#fff;padding:20px 32px 32px;border-radius:0 0 20px 20px;">
@@ -980,9 +1070,11 @@ def send_email(html: str, subject: str, cfg: dict) -> None:
 def main() -> None:
     api_token = os.environ['CLICKUP_TOKEN']
     team_id = os.environ.get('CLICKUP_WORKSPACE', '').strip()
-    gmail_from = os.environ['GMAIL_ADDRESS']
-    gmail_password = os.environ['GMAIL_APP_PASSWORD']
-    email_to = os.environ['EMAIL_TO']
+    preview = '--preview' in sys.argv
+    if not preview:
+        gmail_from = os.environ['GMAIL_ADDRESS']
+        gmail_password = os.environ['GMAIL_APP_PASSWORD']
+        email_to = os.environ['EMAIL_TO']
 
     client = ClickUpClient(api_token)
     if not team_id:
@@ -1021,7 +1113,7 @@ def main() -> None:
         print('  [warn] No "Ticket Type" custom field found on any ticket — '
               'the Ticket Type column will show "—". Check the field name in ClickUp.')
 
-    print(f'\nSummary (last week only): {len(onboarding)} onboarding client(s), '
+    print(f'\nSummary ({_period()} only): {len(onboarding)} onboarding client(s), '
           f'{len(resource_tracking)} resource(s) with tracked time, '
           f'{len(support)} client(s) in support')
 
@@ -1029,6 +1121,11 @@ def main() -> None:
     html = build_email_html(onboarding, resource_tracking, support, report_date,
                             milestones=milestones)
     subject = f'Weekly Ops Report — {_last_week_display()}'
+    if preview:
+        with open('weekly_report_preview.html', 'w', encoding='utf-8') as fh:
+            fh.write(html)
+        print('\nPreview written to weekly_report_preview.html (no email sent).')
+        return
 
     send_email(html, subject, {
         'from': gmail_from,
